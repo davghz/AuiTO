@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>entry</key>
+    <dict>
+        <key>cell</key>
+        <string>PSLinkCell</string>
+        <key>label</key>
+        <string>AuiTO Daemon</string>
+    </dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Touch</string>
+            <key>footerText</key>
+            <string>Tune touch routing behavior for daemon and SpringBoard proxy paths.</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSEditTextCell</string>
+            <key>label</key>
+            <string>Touch Method (ax default, or auto|sim|legacy|bks|zxtouch)</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>TouchMethod</string>
+            <key>placeholder</key>
+            <string>ax</string>
+            <key>autocorrection</key>
+            <false/>
+            <key>autocapitalization</key>
+            <string>none</string>
+            <key>keyboard</key>
+            <string>ascii</string>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Touch Proxy</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>TouchProxy</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>BKS Focus Hints</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>BKSFocusHintsEnabled</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Experimental Non-AX</string>
+            <key>footerText</key>
+            <string>AX is the stable default. Enable strict non-AX only for debugging and R&amp;D.</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Enable Strict Non-AX Methods</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>EnableStrictNonAX</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Enable ZXTouch Backend (Unsafe)</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>EnableZXTouch</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Proxy All Strict Methods</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>TouchProxyAllStrict</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>Lockscreen &amp; Sleep</string>
+            <key>footerText</key>
+            <string>Use Allow Sleep to force idle sleep back on. Block Side Button Sleep controls power-button sleep interception.</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Disable Lock Screen</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>DisableLockScreen</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Prevent Sleep (Idle Timer)</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>PreventSleep</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Block Side Button Sleep</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>BlockSideButtonSleep</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSSwitchCell</string>
+            <key>label</key>
+            <string>Allow Sleep (Override)</string>
+            <key>defaults</key>
+            <string>com.auito.daemon</string>
+            <key>key</key>
+            <string>AllowSleep</string>
+            <key>default</key>
+            <false/>
+            <key>PostNotification</key>
+            <string>com.auito.daemon/prefsChanged</string>
+        </dict>
+    </array>
+</dict>
+</plist>

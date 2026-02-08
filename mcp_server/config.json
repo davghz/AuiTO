@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "auito": {
+      "command": "python3",
+      "args": ["/home/davgz/Documents/Cursor/kimirun/mcp_server/mcp_server.py"],
+      "env": {
+        "AUITO_HOST": "10.0.0.9",
+        "AUITO_PORT": "8765"
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+PLIST="/Library/LaunchDaemons/com.auito.daemon.plist"
+
+if [ -f "$PLIST" ]; then
+  chown root:wheel "$PLIST" || true
+  chmod 644 "$PLIST" || true
+  launchctl unload "$PLIST" >/dev/null 2>&1 || true
+  launchctl load "$PLIST" >/dev/null 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,9 @@
+Package: com.auito.daemon
+Name: AuiTO Daemon
+Version: 0.0.1
+Architecture: iphoneos-arm
+Depends: preferenceloader
+Description: AuiTO AI automation daemon for iOS touch/screenshot/a11y control
+Maintainer: AuiTO Team
+Author: AuiTO Team
+Section: System
