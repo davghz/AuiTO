@@ -1,8 +1,0 @@
-Package: com.aui.touch
-Name: AUI Virtual Touch
-Version: 0.0.1
-Architecture: iphoneos-arm
-Description: Kernel-level virtual HID multitouch digitizer for iOS 13
-Maintainer: AuiTO Team
-Author: AuiTO Team
-Section: System
