@@ -149,8 +149,10 @@ static BOOL KimiRunPrefBool(NSString *key, BOOL defaultValue) {
 }
 
 static BOOL KimiRunStrictProxyFallbackToLocalEnabled(void) {
+    // Default to NO: falling back to local strict dispatch has proven unstable
+    // on some devices and can trigger SpringBoard resprings.
     return KimiRunEnvBool("KIMIRUN_STRICT_PROXY_FALLBACK_LOCAL",
-                          KimiRunPrefBool(@"StrictProxyFallbackLocal", YES));
+                          KimiRunPrefBool(@"StrictProxyFallbackLocal", NO));
 }
 
 static BOOL KimiRunStrictAllowDebugDigestFallback(void) {
@@ -342,11 +344,39 @@ static NSString *KimiRunStrictUIDigestSource(void) {
         }
     }
 
-    BOOL allowLocalFallback = (!forceProxyMethod && KimiRunStrictProxyFallbackToLocalEnabled());
+    NSString *requestedMethod = KimiRunCanonicalTouchMethod([self stringValueFromQuery:path key:@"method"]);
+    BOOL strictRequestedMethod = KimiRunIsStrictExplicitTouchMethod(requestedMethod);
+    BOOL allowLocalFallback = (!strictRequestedMethod &&
+                               !forceProxyMethod &&
+                               KimiRunStrictProxyFallbackToLocalEnabled());
     NSUInteger resolvedProxyPort = 0;
-    NSString *strictProxyBody = [self proxyTouchResponseForPath:path
-                                                        timeout:timeout
-                                                resolvedPortOut:&resolvedProxyPort];
+    NSString *strictProxyBody = nil;
+    if (strictRequestedMethod) {
+        NSString *normalized = [path hasPrefix:@"/"] ? path : [@"/" stringByAppendingString:path];
+        const NSUInteger strictPorts[] = {kPreferencesProxyPort, kMobileSafariProxyPort};
+        const NSUInteger strictPortCount = sizeof(strictPorts) / sizeof(strictPorts[0]);
+        for (NSUInteger i = 0; i < strictPortCount; i++) {
+            NSUInteger port = strictPorts[i];
+            NSString *urlString = [NSString stringWithFormat:@"http://127.0.0.1:%lu%@",
+                                   (unsigned long)port,
+                                   normalized];
+            NSData *data = [self fetchURL:[NSURL URLWithString:urlString] timeout:timeout];
+            if (!data || data.length == 0) {
+                continue;
+            }
+            NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+            if (body.length == 0) {
+                continue;
+            }
+            strictProxyBody = body;
+            resolvedProxyPort = port;
+            break;
+        }
+    } else {
+        strictProxyBody = [self proxyTouchResponseForPath:path
+                                                  timeout:timeout
+                                          resolvedPortOut:&resolvedProxyPort];
+    }
     if (strictProxyBody.length > 0) {
         if (strictProxyBodyOut) {
             *strictProxyBodyOut = strictProxyBody;
@@ -354,8 +384,6 @@ static NSString *KimiRunStrictUIDigestSource(void) {
         if (strictProxyHadResponseOut) {
             *strictProxyHadResponseOut = YES;
         }
-        NSString *requestedMethod = KimiRunCanonicalTouchMethod([self stringValueFromQuery:path key:@"method"]);
-        BOOL strictRequestedMethod = KimiRunIsStrictExplicitTouchMethod(requestedMethod);
         if (KimiRunProxyBodyIndicatesSuccess(strictProxyBody)) {
             if (strictRequestedMethod) {
                 NSString *proxyMode = KimiRunProxyModeFromBody(strictProxyBody);
@@ -424,7 +452,7 @@ static NSString *KimiRunStrictUIDigestSource(void) {
         }
     }
 
-    if (forceProxyMethod) {
+    if (forceProxyMethod || strictRequestedMethod) {
         return [self jsonResponse:500 body:@"{\"status\":\"error\",\"message\":\"Touch proxy unavailable for explicit method\"}"];
     }
     return nil;

@@ -1,8 +1,9 @@
 # AuiTO Makefile (daemon tool + SpringBoard tweak)
 
-export THEOS=/home/davgz/theos
-export TARGET=iphone:clang:13.2.3:13.0
-export ARCHS=arm64
+THEOS ?= /private/var/mobile/Documents/Projects/theos
+TARGET ?= iphone:clang:13.7:13.0
+ARCHS ?= arm64
+export THEOS TARGET ARCHS
 
 TOOL_NAME = auito-daemon
 TWEAK_NAME = auito

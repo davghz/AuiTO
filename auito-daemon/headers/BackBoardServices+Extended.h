@@ -39,21 +39,11 @@ NS_ASSUME_NONNULL_BEGIN
 @protocol OS_dispatch_queue;
 @protocol OS_xpc_object;
 
-#pragma mark - Runtime HID Manager Classes (undeclared in public SDK headers)
+#pragma mark - Runtime HID Routing Classes (undeclared in public SDK headers)
 
 @interface BKAccessibility : NSObject
 
 + (id)_eventRoutingClientConnectionManager;
-
-@end
-
-@interface BKHIDClientConnectionManager : NSObject
-
-+ (instancetype)sharedInstance;
-+ (instancetype)sharedManager;
-+ (instancetype)defaultManager;
-+ (instancetype)manager;
-- (void *)clientForTaskPort:(mach_port_t)port;
 
 @end
 

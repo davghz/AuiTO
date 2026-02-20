@@ -9,8 +9,10 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <QuartzCore/QuartzCore.h>
 #import <math.h>
+#import <dlfcn.h>
 
 static UIImage *CaptureScreenUsingIOSurface(CGFloat scale);
+static UIImage *CaptureScreenUsingScreenshotServices(void);
 static UIImage *CaptureScreenUsingUIKit(void);
 static BOOL KimiRunImageAppearsBlack(UIImage *image);
 static NSArray<UIWindow *> *KimiRunForegroundWindows(void);
@@ -34,8 +36,11 @@ static NSArray<UIWindow *> *KimiRunForegroundWindows(void);
         CGFloat scale = [UIScreen mainScreen].scale;
         image = CaptureScreenUsingIOSurface(scale);
         if (image && KimiRunImageAppearsBlack(image)) {
-            NSLog(@"[KimiRunScreenshot] IOSurface frame appears black, falling back to UIKit composition");
+            NSLog(@"[KimiRunScreenshot] IOSurface frame appears black, trying ScreenshotServices/UIKit fallback");
             image = nil;
+        }
+        if (!image) {
+            image = CaptureScreenUsingScreenshotServices();
         }
         if (!image) {
             image = CaptureScreenUsingUIKit();
@@ -220,6 +225,87 @@ static UIImage *CaptureScreenUsingIOSurface(CGFloat scale) {
 
     UIImage *image = [UIImage imageWithCGImage:cgImage scale:scale orientation:UIImageOrientationUp];
     CGImageRelease(cgImage);
+    return image;
+}
+
+static UIImage *CaptureScreenUsingScreenshotServices(void) {
+    static dispatch_once_t onceToken;
+    static BOOL frameworkLoadAttempted = NO;
+    static BOOL frameworkLoaded = NO;
+    dispatch_once(&onceToken, ^{
+        frameworkLoadAttempted = YES;
+        void *handle = dlopen("/System/Library/PrivateFrameworks/ScreenshotServices.framework/ScreenshotServices", RTLD_LAZY);
+        frameworkLoaded = (handle != NULL);
+        if (!frameworkLoaded) {
+            const char *err = dlerror();
+            NSLog(@"[KimiRunScreenshot] ScreenshotServices load failed: %s", err ? err : "unknown");
+        }
+    });
+
+    if (!frameworkLoadAttempted || !frameworkLoaded) {
+        return nil;
+    }
+
+    Class mainSnapshotterClass = NSClassFromString(@"SSMainScreenSnapshotter");
+    Class baseSnapshotterClass = NSClassFromString(@"SSScreenSnapshotter");
+    Class snapshotterClass = mainSnapshotterClass ?: baseSnapshotterClass;
+    if (!snapshotterClass) {
+        NSLog(@"[KimiRunScreenshot] ScreenshotServices classes unavailable");
+        return nil;
+    }
+
+    UIScreen *mainScreen = [UIScreen mainScreen];
+    id snapshotter = nil;
+
+    if ([snapshotterClass respondsToSelector:@selector(snapshotterForScreen:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        snapshotter = [snapshotterClass performSelector:@selector(snapshotterForScreen:) withObject:mainScreen];
+#pragma clang diagnostic pop
+    }
+
+    if (!snapshotter && [snapshotterClass instancesRespondToSelector:@selector(initWithScreen:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id allocObj = [snapshotterClass alloc];
+        snapshotter = [allocObj performSelector:@selector(initWithScreen:) withObject:mainScreen];
+#pragma clang diagnostic pop
+    }
+    if (!snapshotter) {
+        snapshotter = [[snapshotterClass alloc] init];
+    }
+    if (!snapshotter || ![snapshotter respondsToSelector:@selector(takeScreenshot)]) {
+        return nil;
+    }
+
+    id raw = nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    raw = [snapshotter performSelector:@selector(takeScreenshot)];
+#pragma clang diagnostic pop
+
+    UIImage *image = nil;
+    if ([raw isKindOfClass:[UIImage class]]) {
+        image = (UIImage *)raw;
+    } else if (raw && [raw respondsToSelector:@selector(image)]) {
+        id nested = nil;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        nested = [raw performSelector:@selector(image)];
+#pragma clang diagnostic pop
+        if ([nested isKindOfClass:[UIImage class]]) {
+            image = (UIImage *)nested;
+        }
+    }
+
+    if (!image) {
+        return nil;
+    }
+    if (KimiRunImageAppearsBlack(image)) {
+        NSLog(@"[KimiRunScreenshot] ScreenshotServices frame appears black");
+        return nil;
+    }
+    NSLog(@"[KimiRunScreenshot] Captured via ScreenshotServices");
     return image;
 }
 

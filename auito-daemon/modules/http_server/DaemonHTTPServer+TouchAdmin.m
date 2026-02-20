@@ -231,7 +231,7 @@ static BOOL KimiRunTouchProxyEnabled(void) {
         KimiRunSetPrefBool(@"TouchProxy", setProxy);
     } else {
         KimiRunSetPrefBool(@"ForceAX", NO);
-        KimiRunSetPrefString(@"TouchMethod", @"auto");
+        KimiRunSetPrefString(@"TouchMethod", @"direct");
     }
 
     NSDictionary *enableResult = enabled ? [AXTouchInjection ensureAccessibilityEnabled] : @{};

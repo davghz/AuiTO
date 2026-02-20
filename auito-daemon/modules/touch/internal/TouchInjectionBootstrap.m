@@ -1,6 +1,33 @@
 #import "TouchInjectionInternal.h"
 #import <dlfcn.h>
 
+static BOOL KimiRunIsSpringBoardProcess(void) {
+    static dispatch_once_t onceToken;
+    static BOOL isSpringBoard = NO;
+    dispatch_once(&onceToken, ^{
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        NSString *processName = [[NSProcessInfo processInfo] processName];
+        isSpringBoard = [bundleID isEqualToString:@"com.apple.springboard"] ||
+                        [processName isEqualToString:@"SpringBoard"];
+    });
+    return isSpringBoard;
+}
+
+static BOOL KimiRunForceSenderCapture(void) {
+    return KimiRunTouchEnvBool("KIMIRUN_FORCE_SENDER_CAPTURE",
+                               KimiRunTouchPrefBool(@"ForceSenderCapture", NO));
+}
+
+static BOOL KimiRunShouldStartSenderCapture(void) {
+    if (KimiRunForceSenderCapture()) {
+        return YES;
+    }
+    if (KimiRunIsSpringBoardProcess()) {
+        return YES;
+    }
+    return (g_senderID == 0);
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
 @implementation KimiRunTouchInjection (Bootstrap)
@@ -21,7 +48,7 @@
     g_senderUseMatching = KimiRunTouchEnvBool("KIMIRUN_SENDER_MATCHING",
                                               KimiRunTouchPrefBool(@"SenderUseMatching", NO));
     g_senderUseExtraCallbacks = KimiRunTouchEnvBool("KIMIRUN_SENDER_EXTRACB",
-                                                    KimiRunTouchPrefBool(@"SenderUseExtraCallbacks", YES));
+                                                    KimiRunTouchPrefBool(@"SenderUseExtraCallbacks", NO));
     g_touchUseMatching = KimiRunTouchEnvBool("KIMIRUN_TOUCH_MATCHING",
                                              KimiRunTouchPrefBool(@"TouchUseMatching", NO));
 
@@ -29,6 +56,10 @@
     KimiRunLoadPersistedSenderID();
     // Try IORegistry-based sender ID (Multitouch ID) before callbacks
     KimiRunTryLoadSenderIDFromIORegistry();
+    BOOL shouldStartSenderCapture = KimiRunShouldStartSenderCapture();
+    if (!shouldStartSenderCapture && g_senderID != 0) {
+        g_senderCaptured = YES;
+    }
     
     // Load IOKit dynamically
     void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
@@ -145,7 +176,7 @@
           g_touchUseMatching, g_senderUseMatching, g_senderUseExtraCallbacks);
 
     // Start sender ID capture (SimulateTouch)
-    if (!g_senderCaptured &&
+    if (!g_senderCaptured && shouldStartSenderCapture &&
         _IOHIDEventSystemClientCreate && _IOHIDEventSystemClientScheduleWithRunLoop &&
         _IOHIDEventSystemClientRegisterEventCallback && _IOHIDEventGetType && _IOHIDEventGetSenderID) {
         if (!g_senderThread) {

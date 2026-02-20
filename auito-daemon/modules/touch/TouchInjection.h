@@ -277,7 +277,8 @@ NS_ASSUME_NONNULL_BEGIN
 + (BOOL)forceFocusSearchField;
 
 /**
- * Log runtime selectors for BKHIDClientConnectionManager.
+ * Log runtime selectors for BKSHID/BKAccessibility routing classes.
+ * Method name is retained for API compatibility.
  */
 + (void)logBKHIDSelectorsNow;
 

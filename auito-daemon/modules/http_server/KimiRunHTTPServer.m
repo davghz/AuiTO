@@ -33,11 +33,15 @@
 // Forward declaration of callback
 static void SocketCallback(CFSocketRef s, CFSocketCallBackType type, CFDataRef address, const void *data, void *info);
 static NSString *KimiRunCanonicalModeFromMethod(NSString *method);
+static BOOL KimiRunTouchProxyEnabled(void);
+static BOOL KimiRunProxyAllStrictMethodsEnabled(void);
+static BOOL KimiRunIsStrictExplicitTouchMethod(NSString *method);
 static NSDictionary *KimiRunWakeAndUnlockDevice(void);
 static NSString *KimiRunFrontmostBundleID(void);
 static NSDictionary *KimiRunLockState(void);
 static BOOL KimiRunLaunchAppBundleID(NSString *bundleID);
 static NSArray *KimiRunListApplications(BOOL includeSystem);
+static NSString *const kKimiRunPrefsSuite = @"com.auito.daemon";
 static NSUInteger sLastGoodCapturePort = 0;
 static NSUInteger sLastGoodTouchPort = 0;
 
@@ -55,6 +59,70 @@ static NSString *KimiRunCanonicalModeFromMethod(NSString *method) {
     if ([lower isEqualToString:@"zx"]) return @"zxtouch";
     if ([lower isEqualToString:@"a11y"]) return @"ax";
     return lower;
+}
+
+static BOOL KimiRunEnvBool(const char *key, BOOL defaultValue) {
+    if (!key) {
+        return defaultValue;
+    }
+    const char *value = getenv(key);
+    if (!value || value[0] == '\0') {
+        return defaultValue;
+    }
+    NSString *lower = [[[NSString stringWithUTF8String:value]
+                        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                       lowercaseString];
+    if ([lower isEqualToString:@"1"] || [lower isEqualToString:@"true"] ||
+        [lower isEqualToString:@"yes"] || [lower isEqualToString:@"on"]) {
+        return YES;
+    }
+    if ([lower isEqualToString:@"0"] || [lower isEqualToString:@"false"] ||
+        [lower isEqualToString:@"no"] || [lower isEqualToString:@"off"]) {
+        return NO;
+    }
+    return defaultValue;
+}
+
+static BOOL KimiRunPrefBool(NSString *key, BOOL defaultValue) {
+    if (![key isKindOfClass:[NSString class]] || key.length == 0) {
+        return defaultValue;
+    }
+    NSUserDefaults *prefs = [[NSUserDefaults alloc] initWithSuiteName:kKimiRunPrefsSuite];
+    id value = [prefs objectForKey:key];
+    if (!value) {
+        return defaultValue;
+    }
+    return [prefs boolForKey:key];
+}
+
+static BOOL KimiRunTouchProxyEnabled(void) {
+    if (KimiRunEnvBool("KIMIRUN_TOUCH_PROXY", NO)) {
+        return YES;
+    }
+    if (KimiRunEnvBool("KIMIRUN_NONAX_VIA_SPRINGBOARD", NO)) {
+        return YES;
+    }
+    return KimiRunPrefBool(@"TouchProxy", NO);
+}
+
+static BOOL KimiRunProxyAllStrictMethodsEnabled(void) {
+    if (KimiRunEnvBool("KIMIRUN_TOUCH_PROXY_ALL_STRICT", NO)) {
+        return YES;
+    }
+    if (KimiRunEnvBool("KIMIRUN_NONAX_VIA_SPRINGBOARD", NO)) {
+        return YES;
+    }
+    return KimiRunPrefBool(@"TouchProxyAllStrict", NO);
+}
+
+static BOOL KimiRunIsStrictExplicitTouchMethod(NSString *method) {
+    NSString *canonical = KimiRunCanonicalModeFromMethod(method);
+    return ([canonical isEqualToString:@"sim"] ||
+            [canonical isEqualToString:@"direct"] ||
+            [canonical isEqualToString:@"legacy"] ||
+            [canonical isEqualToString:@"conn"] ||
+            [canonical isEqualToString:@"bks"] ||
+            [canonical isEqualToString:@"zxtouch"]);
 }
 
 static NSDictionary *KimiRunWakeAndUnlockDevice(void) {
@@ -512,9 +580,21 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
         close(nativeSocket);
         return;
     }
+    CFReadStreamSetProperty(readStream, kCFStreamPropertyShouldCloseNativeSocket, kCFBooleanTrue);
+    CFWriteStreamSetProperty(writeStream, kCFStreamPropertyShouldCloseNativeSocket, kCFBooleanTrue);
     
-    CFReadStreamOpen(readStream);
-    CFWriteStreamOpen(writeStream);
+    if (!CFReadStreamOpen(readStream) || !CFWriteStreamOpen(writeStream)) {
+        NSLog(@"[KimiRunHTTPServer] Failed to open streams");
+        if (readStream) {
+            CFReadStreamClose(readStream);
+            CFRelease(readStream);
+        }
+        if (writeStream) {
+            CFWriteStreamClose(writeStream);
+            CFRelease(writeStream);
+        }
+        return;
+    }
     
     // Read HTTP request - wait for header terminator \r\n\r\n
     UInt8 buffer[HTTP_BUFFER_SIZE];
@@ -526,6 +606,12 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
         // Timeout after 3 seconds
         if ([[NSDate date] timeIntervalSinceDate:startTime] > 3.0) {
             NSLog(@"[KimiRunHTTPServer] Read timeout");
+            break;
+        }
+        CFStreamStatus readStatus = CFReadStreamGetStatus(readStream);
+        if (readStatus == kCFStreamStatusAtEnd ||
+            readStatus == kCFStreamStatusError ||
+            readStatus == kCFStreamStatusClosed) {
             break;
         }
         
@@ -567,19 +653,34 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
     const UInt8 *bytes = [responseData bytes];
     CFIndex totalLength = [responseData length];
     CFIndex bytesWritten = 0;
+    CFAbsoluteTime writeIdleDeadline = CFAbsoluteTimeGetCurrent() + 2.0;
     
     // Ensure all bytes are written (important for large responses like screenshots)
     while (bytesWritten < totalLength) {
+        CFStreamStatus writeStatus = CFWriteStreamGetStatus(writeStream);
+        if (writeStatus == kCFStreamStatusAtEnd ||
+            writeStatus == kCFStreamStatusError ||
+            writeStatus == kCFStreamStatusClosed) {
+            NSLog(@"[KimiRunHTTPServer] Stream closed before full write");
+            break;
+        }
         CFIndex result = CFWriteStreamWrite(writeStream, bytes + bytesWritten, totalLength - bytesWritten);
+        if (result > 0) {
+            bytesWritten += result;
+            writeIdleDeadline = CFAbsoluteTimeGetCurrent() + 2.0;
+            continue;
+        }
         if (result < 0) {
             NSLog(@"[KimiRunHTTPServer] Write error");
             break;
         }
-        if (result == 0) {
+        if (result == 0 && CFAbsoluteTimeGetCurrent() <= writeIdleDeadline) {
             // Would block, wait a bit
             usleep(1000);
+            continue;
         }
-        bytesWritten += result;
+        NSLog(@"[KimiRunHTTPServer] Write timeout");
+        break;
     }
     
     NSLog(@"[KimiRunHTTPServer] Sent %ld/%ld bytes", (long)bytesWritten, (long)totalLength);
@@ -589,7 +690,6 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
     CFWriteStreamClose(writeStream);
     CFRelease(readStream);
     CFRelease(writeStream);
-    close(nativeSocket);
     
     NSLog(@"[KimiRunHTTPServer] Connection handled and closed");
 }
@@ -2211,11 +2311,13 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
 }
 
 - (BOOL)shouldProxyForegroundTouchMethod:(NSString *)method {
-    NSString *lower = @"auto";
-    if ([method isKindOfClass:[NSString class]] && method.length > 0) {
-        lower = [[method stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    NSString *canonical = KimiRunCanonicalModeFromMethod(method);
+    if (canonical.length == 0 ||
+        [canonical isEqualToString:@"auto"] ||
+        [canonical isEqualToString:@"ax"]) {
+        return YES;
     }
-    if (lower.length == 0 || [lower isEqualToString:@"auto"] || [lower isEqualToString:@"ax"]) {
+    if (KimiRunIsStrictExplicitTouchMethod(canonical)) {
         return YES;
     }
     return NO;
@@ -2259,6 +2361,11 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
                   (unsigned long)port, fullPath, requestedMethod ?: @"auto");
             return fallbackResponse;
         }
+    }
+    if (KimiRunIsStrictExplicitTouchMethod(requestedMethod)) {
+        NSLog(@"[KimiRunHTTPServer] Strict touch proxy failed for %@ method=%@; refusing local SpringBoard dispatch",
+              fullPath, requestedMethod ?: @"auto");
+        return [self errorResponse:500 message:@"Strict method requires foreground proxy target"];
     }
     return nil;
 }
@@ -2421,6 +2528,8 @@ static void SocketCallback(CFSocketRef s, CFSocketCallBackType type, CFDataRef a
     if (type == kCFSocketAcceptCallBack) {
         CFSocketNativeHandle nativeSocket = *(CFSocketNativeHandle *)data;
         NSLog(@"[KimiRunHTTPServer] New connection accepted");
-        [server handleConnection:nativeSocket];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [server handleConnection:nativeSocket];
+        });
     }
 }

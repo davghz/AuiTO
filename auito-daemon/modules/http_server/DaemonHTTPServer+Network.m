@@ -1,10 +1,25 @@
 #import "DaemonHTTPServer.h"
 #import <Foundation/Foundation.h>
 #import <unistd.h>
+#import "../screenshot/KimiRunScreenshot.h"
 
 static const NSUInteger kSpringBoardProxyPort = 8765;
 static const NSUInteger kPreferencesProxyPort = 8766;
 static const NSUInteger kMobileSafariProxyPort = 8767;
+
+static BOOL KimiRunDaemonLocalScreenshotEnabled(void) {
+    const char *value = getenv("KIMIRUN_DAEMON_LOCAL_SCREENSHOT");
+    if (!value || value[0] == '\0') {
+        return NO;
+    }
+    NSString *lower = [[[NSString stringWithUTF8String:value]
+                        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                       lowercaseString];
+    return ([lower isEqualToString:@"1"] ||
+            [lower isEqualToString:@"true"] ||
+            [lower isEqualToString:@"yes"] ||
+            [lower isEqualToString:@"on"]);
+}
 
 @implementation DaemonHTTPServer (Network)
 
@@ -33,8 +48,10 @@ static const NSUInteger kMobileSafariProxyPort = 8767;
     dispatch_time_t t = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC));
     if (dispatch_semaphore_wait(sema, t) != 0) {
         [task cancel];
+        [session invalidateAndCancel];
         return nil;
     }
+    [session finishTasksAndInvalidate];
     if (error) {
         return nil;
     }
@@ -138,37 +155,78 @@ static const NSUInteger kMobileSafariProxyPort = 8767;
 }
 
 - (NSData *)fetchSpringBoardScreenshotData {
-    NSString *fileURL = [NSString stringWithFormat:@"http://127.0.0.1:%lu/screenshot/file?format=png",
-                         (unsigned long)kSpringBoardProxyPort];
-    NSData *fileResp = [self fetchURL:[NSURL URLWithString:fileURL] timeout:1.5];
-    if (fileResp) {
+    // Prioritize SpringBoard first for stability; app-process servers are optional.
+    const NSUInteger ports[] = {kSpringBoardProxyPort, kPreferencesProxyPort, kMobileSafariProxyPort};
+    const NSUInteger portCount = sizeof(ports) / sizeof(ports[0]);
+
+    // Attempt file-based capture first. Some app-process servers can stall this
+    // endpoint, so keep timeout conservative and continue on failure.
+    for (NSUInteger i = 0; i < portCount; i++) {
+        NSUInteger port = ports[i];
+        NSTimeInterval timeout = (port == kSpringBoardProxyPort) ? 1.2 : 0.45;
+        NSString *fileURL = [NSString stringWithFormat:@"http://127.0.0.1:%lu/screenshot/file?format=png",
+                             (unsigned long)port];
+        NSData *fileResp = [self fetchURL:[NSURL URLWithString:fileURL] timeout:timeout];
+        if (fileResp.length == 0) {
+            continue;
+        }
         NSError *error = nil;
         id obj = [NSJSONSerialization JSONObjectWithData:fileResp options:0 error:&error];
-        if (!error && [obj isKindOfClass:[NSDictionary class]]) {
-            NSString *path = [obj[@"path"] isKindOfClass:[NSString class]] ? obj[@"path"] : nil;
-            if (path.length > 0) {
-                NSData *fileData = [NSData dataWithContentsOfFile:path];
-                if (fileData.length > 0) {
-                    unlink([path fileSystemRepresentation]);
-                    return fileData;
-                }
-            }
+        if (error || ![obj isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSString *path = [obj[@"path"] isKindOfClass:[NSString class]] ? obj[@"path"] : nil;
+        if (path.length == 0) {
+            continue;
+        }
+        NSData *fileData = [NSData dataWithContentsOfFile:path];
+        if (fileData.length > 0) {
+            unlink([path fileSystemRepresentation]);
+            return fileData;
         }
     }
 
-    NSString *b64URL = [NSString stringWithFormat:@"http://127.0.0.1:%lu/screenshot",
-                        (unsigned long)kSpringBoardProxyPort];
-    NSData *b64Resp = [self fetchURL:[NSURL URLWithString:b64URL] timeout:1.5];
-    if (!b64Resp) return nil;
+    // Fall back to base64 screenshot endpoint. SpringBoard payload is large, so
+    // this timeout must be high enough to transfer and decode the full JSON blob.
+    for (NSUInteger i = 0; i < portCount; i++) {
+        NSUInteger port = ports[i];
+        NSTimeInterval timeout = (port == kSpringBoardProxyPort) ? 2.6 : 0.8;
+        NSString *b64URL = [NSString stringWithFormat:@"http://127.0.0.1:%lu/screenshot",
+                            (unsigned long)port];
+        NSData *b64Resp = [self fetchURL:[NSURL URLWithString:b64URL] timeout:timeout];
+        if (b64Resp.length == 0) {
+            continue;
+        }
 
-    NSError *error = nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:b64Resp options:0 error:&error];
-    if (error || ![obj isKindOfClass:[NSDictionary class]]) {
+        NSError *error = nil;
+        id obj = [NSJSONSerialization JSONObjectWithData:b64Resp options:0 error:&error];
+        if (error || ![obj isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSString *dataB64 = [obj[@"data"] isKindOfClass:[NSString class]] ? obj[@"data"] : nil;
+        if (dataB64.length == 0) {
+            continue;
+        }
+        NSData *proxyData = [[NSData alloc] initWithBase64EncodedString:dataB64 options:0];
+        if (proxyData.length > 0) {
+            return proxyData;
+        }
+    }
+
+    if (!KimiRunDaemonLocalScreenshotEnabled()) {
         return nil;
     }
-    NSString *dataB64 = [obj[@"data"] isKindOfClass:[NSString class]] ? obj[@"data"] : nil;
-    if (!dataB64.length) return nil;
-    return [[NSData alloc] initWithBase64EncodedString:dataB64 options:0];
+
+    __block NSData *localData = nil;
+    void (^captureBlock)(void) = ^{
+        localData = [[KimiRunScreenshot sharedScreenshot] captureScreenAsPNG];
+    };
+    if ([NSThread isMainThread]) {
+        captureBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), captureBlock);
+    }
+    return localData.length > 0 ? localData : nil;
 }
 
 @end

@@ -57,6 +57,13 @@ static NSString *KimiRunBKSEventMode(void) {
     return @"sim_parent";
 }
 
+static BOOL KimiRunBKSAllowBackboarddTarget(void) {
+    // Dispatching synthesized gesture phases directly to backboardd is unstable
+    // on some devices and can trigger resprings. Keep this opt-in for debugging.
+    return KimiRunTouchEnvBool("KIMIRUN_BKS_ALLOW_BACKBOARDD_TARGET",
+                               KimiRunTouchPrefBool(@"BKSAllowBackboarddTarget", NO));
+}
+
 static BKSHIDEventDiscreteDispatchingPredicate *
 KimiRunCreateDispatchPredicate(id descriptor, BOOL useSourceDescriptor)
 {
@@ -913,6 +920,7 @@ static BOOL KimiRunBKSDispatchEventAfterRouting(IOHIDEventRef event, NSString **
         NSMutableArray<NSDictionary *> *routeAttempts = [NSMutableArray array];
         NSMutableArray *pendingDispatchAssertions = [NSMutableArray array];
         g_bksLastMeaningfulDispatch = NO;
+        BOOL allowBackboarddTarget = KimiRunBKSAllowBackboarddTarget();
 
         for (NSDictionary *entry in targetCandidates) {
             id target = entry[@"target"];
@@ -922,6 +930,17 @@ static BOOL KimiRunBKSDispatchEventAfterRouting(IOHIDEventRef event, NSString **
                 continue;
             }
             int targetPid = KimiRunBKSTargetPID(target);
+            BOOL targetIsBackboardd = (targetPid > 0 &&
+                                       backboarddPid > 0 &&
+                                       targetPid == backboarddPid);
+            if (targetIsBackboardd && !allowBackboarddTarget) {
+                KimiRunLog([NSString stringWithFormat:
+                            @"[BKS] skip backboardd target source=%@ destination=%@ pid=%d",
+                            source,
+                            destination ? [destination stringValue] : @"(none)",
+                            targetPid]);
+                continue;
+            }
 
             if ([focusHintPhase isEqualToString:@"per_target"]) {
                 KimiRunApplyBKSFocusHints();
@@ -980,7 +999,9 @@ static BOOL KimiRunBKSDispatchEventAfterRouting(IOHIDEventRef event, NSString **
                                            [source isEqualToString:@"keyboardFocusTarget"] ||
                                            [source isEqualToString:@"systemTarget"] ||
                                            [source hasPrefix:@"focusTargetForPID"]);
-                BOOL pidIsMeaningful = (targetPid <= 0 || targetPid != (int)getpid());
+                BOOL pidIsMeaningful = (targetPid <= 0 ||
+                                        (targetPid != (int)getpid() &&
+                                         targetPid != backboarddPid));
                 BOOL meaningfulAcceptance = sourceIsMeaningful && pidIsMeaningful;
                 NSInteger preferenceScore = KimiRunBKSTargetPreferenceScore(source,
                                                                             targetPid,

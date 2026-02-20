@@ -2,9 +2,11 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
+#import <sys/time.h>
 #import <netinet/in.h>
 #import <sys/utsname.h>
 #import <unistd.h>
+#import <errno.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import "../touch/TouchInjection.h"
@@ -102,8 +104,23 @@ static NSString *KimiRunDefaultTouchMethod(void) {
     if ([prefMethod isKindOfClass:[NSString class]] && prefMethod.length > 0) {
         return prefMethod;
     }
-    // Default to AX for stable real-world operation.
-    return @"ax";
+    // Default to real gesture dispatch.
+    return @"direct";
+}
+
+static NSString *KimiRunRequestedOrDefaultTouchMethod(NSString *method) {
+    if ([method isKindOfClass:[NSString class]]) {
+        NSString *trimmed = [method stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length > 0) {
+            return trimmed;
+        }
+    }
+    NSString *fallback = KimiRunDefaultTouchMethod();
+    if (![fallback isKindOfClass:[NSString class]]) {
+        return @"auto";
+    }
+    NSString *trimmedFallback = [fallback stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmedFallback.length > 0 ? trimmedFallback : @"auto";
 }
 
 static BOOL KimiRunEnvBool(const char *key, BOOL defaultValue) {
@@ -225,6 +242,11 @@ static BOOL KimiRunProxyAllStrictMethodsEnabled(void) {
     return KimiRunPrefBool(@"TouchProxyAllStrict", NO);
 }
 
+static BOOL KimiRunStrictProxyFallbackToLocalEnabled(void) {
+    return KimiRunEnvBool("KIMIRUN_STRICT_PROXY_FALLBACK_LOCAL",
+                          KimiRunPrefBool(@"StrictProxyFallbackLocal", NO));
+}
+
 static BOOL KimiRunUIDeltaGateStrictLocalEnabled(void) {
     return KimiRunEnvBool("KIMIRUN_STRICT_LOCAL_UIDELTA",
                           KimiRunPrefBool(@"StrictLocalUIDelta", YES));
@@ -234,10 +256,8 @@ static BOOL KimiRunShouldUseStrictProxyOnly(NSString *method) {
     if (KimiRunShouldForceProxyMethod(method)) {
         return YES;
     }
-    if (!KimiRunIsStrictExplicitTouchMethod(method)) {
-        return NO;
-    }
-    return KimiRunTouchProxyEnabled() && KimiRunProxyAllStrictMethodsEnabled();
+    // Strict methods should never dispatch locally in daemon process.
+    return KimiRunIsStrictExplicitTouchMethod(method);
 }
 
 static BOOL KimiRunShouldGateLocalStrictMethodWithUIDelta(NSString *method) {
@@ -610,28 +630,25 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
 }
 
 - (void)handleConnection:(CFSocketNativeHandle)nativeSocket {
-    CFReadStreamRef readStream = NULL;
-    CFWriteStreamRef writeStream = NULL;
-    CFStreamCreatePairWithSocket(kCFAllocatorDefault, nativeSocket, &readStream, &writeStream);
-    if (!readStream || !writeStream) {
-        close(nativeSocket);
-        return;
-    }
+    @autoreleasepool {
+        struct timeval timeout;
+        timeout.tv_sec = 2;
+        timeout.tv_usec = 0;
+        setsockopt(nativeSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(nativeSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    CFReadStreamOpen(readStream);
-    CFWriteStreamOpen(writeStream);
+        UInt8 buffer[HTTP_BUFFER_SIZE];
+        NSMutableData *requestData = [NSMutableData data];
+        BOOL headerComplete = NO;
+        NSInteger contentLength = 0;
+        NSUInteger headerEndIndex = 0;
+        int headerTimeouts = 0;
 
-    UInt8 buffer[HTTP_BUFFER_SIZE];
-    NSMutableData *requestData = [NSMutableData data];
-    BOOL headerComplete = NO;
-    NSInteger contentLength = 0;
-    NSUInteger headerEndIndex = 0;
-
-    while (!headerComplete) {
-        if (CFReadStreamHasBytesAvailable(readStream)) {
-            CFIndex bytesRead = CFReadStreamRead(readStream, buffer, HTTP_BUFFER_SIZE - 1);
+        while (!headerComplete) {
+            ssize_t bytesRead = recv(nativeSocket, buffer, HTTP_BUFFER_SIZE - 1, 0);
             if (bytesRead > 0) {
-                [requestData appendBytes:buffer length:bytesRead];
+                headerTimeouts = 0;
+                [requestData appendBytes:buffer length:(NSUInteger)bytesRead];
                 NSString *tempString = [[NSString alloc] initWithData:requestData encoding:NSUTF8StringEncoding];
                 if ([tempString rangeOfString:@"\r\n\r\n"].location != NSNotFound) {
                     headerComplete = YES;
@@ -639,55 +656,71 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
                     headerEndIndex = headerRange.location + headerRange.length;
                     contentLength = [self contentLengthFromHeaderString:tempString];
                 }
-            } else {
+                continue;
+            }
+            if (bytesRead == 0) {
                 break;
             }
-        } else {
-            usleep(1000);
-        }
-    }
-
-    if (headerComplete && contentLength > 0) {
-        while ((NSInteger)requestData.length < (NSInteger)headerEndIndex + contentLength) {
-            if (CFReadStreamHasBytesAvailable(readStream)) {
-                CFIndex bytesRead = CFReadStreamRead(readStream, buffer, HTTP_BUFFER_SIZE - 1);
-                if (bytesRead > 0) {
-                    [requestData appendBytes:buffer length:bytesRead];
-                } else {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                headerTimeouts += 1;
+                if (requestData.length == 0 || headerTimeouts >= 2) {
                     break;
                 }
-            } else {
-                usleep(1000);
+                continue;
+            }
+            break;
+        }
+
+        if (headerComplete && contentLength > 0) {
+            while ((NSInteger)requestData.length < (NSInteger)headerEndIndex + contentLength) {
+                ssize_t bytesRead = recv(nativeSocket, buffer, HTTP_BUFFER_SIZE - 1, 0);
+                if (bytesRead > 0) {
+                    [requestData appendBytes:buffer length:(NSUInteger)bytesRead];
+                    continue;
+                }
+                if (bytesRead == 0) {
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
             }
         }
-    }
 
-    NSString *requestString = [[NSString alloc] initWithData:requestData encoding:NSUTF8StringEncoding] ?: @"";
-    id response = [self responseForRequest:requestString];
+        NSString *requestString = [[NSString alloc] initWithData:requestData encoding:NSUTF8StringEncoding] ?: @"";
+        id response = [self responseForRequest:requestString];
 
-    NSData *responseData = nil;
-    if ([response isKindOfClass:[NSData class]]) {
-        responseData = (NSData *)response;
-    } else if ([response isKindOfClass:[NSString class]]) {
-        responseData = [(NSString *)response dataUsingEncoding:NSUTF8StringEncoding];
-    } else {
-        responseData = [@"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
-                        dataUsingEncoding:NSUTF8StringEncoding];
-    }
-    const UInt8 *bytes = responseData.bytes;
-    CFIndex totalLength = responseData.length;
-    CFIndex bytesWritten = 0;
-    while (bytesWritten < totalLength) {
-        CFIndex result = CFWriteStreamWrite(writeStream, bytes + bytesWritten, totalLength - bytesWritten);
-        if (result <= 0) break;
-        bytesWritten += result;
-    }
+        NSData *responseData = nil;
+        if ([response isKindOfClass:[NSData class]]) {
+            responseData = (NSData *)response;
+        } else if ([response isKindOfClass:[NSString class]]) {
+            responseData = [(NSString *)response dataUsingEncoding:NSUTF8StringEncoding];
+        } else {
+            responseData = [@"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
+                            dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        const UInt8 *bytes = responseData.bytes;
+        CFIndex totalLength = responseData.length;
+        CFIndex bytesWritten = 0;
+        while (bytesWritten < totalLength) {
+            ssize_t result = send(nativeSocket, bytes + bytesWritten, (size_t)(totalLength - bytesWritten), 0);
+            if (result > 0) {
+                bytesWritten += (CFIndex)result;
+                continue;
+            }
+            if (result < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
 
-    CFReadStreamClose(readStream);
-    CFWriteStreamClose(writeStream);
-    CFRelease(readStream);
-    CFRelease(writeStream);
-    close(nativeSocket);
+        shutdown(nativeSocket, SHUT_RDWR);
+        close(nativeSocket);
+    }
 }
 
 - (id)responseForRequest:(NSString *)request {
@@ -1159,6 +1192,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         NSDictionary *localDiag = [KimiRunTouchInjection hidDiagnostics];
         BOOL proxyEnabled = KimiRunTouchProxyEnabled();
         BOOL proxyAllStrict = KimiRunProxyAllStrictMethodsEnabled();
+        BOOL strictProxyFallbackLocal = KimiRunStrictProxyFallbackToLocalEnabled();
         BOOL enableStrictNonAX = KimiRunEnvBool("KIMIRUN_ENABLE_STRICT_NON_AX",
                                                  KimiRunPrefBool(@"EnableStrictNonAX", NO));
         BOOL nonaxViaSpringBoard = KimiRunEnvBool("KIMIRUN_NONAX_VIA_SPRINGBOARD", NO);
@@ -1180,6 +1214,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
             @"proxyConfig": @{
                 @"touchProxyEnabled": @(proxyEnabled),
                 @"touchProxyAllStrict": @(proxyAllStrict),
+                @"strictProxyFallbackLocal": @(strictProxyFallbackLocal),
                 @"enableStrictNonAX": @(enableStrictNonAX),
                 @"nonaxViaSpringBoard": @(nonaxViaSpringBoard),
             },
@@ -1201,6 +1236,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         CGFloat x = [self floatValueFromQuery:path key:@"x"];
         CGFloat y = [self floatValueFromQuery:path key:@"y"];
         NSString *method = [self stringValueFromQuery:path key:@"method"];
+        method = KimiRunRequestedOrDefaultTouchMethod(method);
         NSString *unsupportedMethodMessage = KimiRunUnsupportedTouchMethodMessage(method);
         if (unsupportedMethodMessage.length > 0) {
             NSString *json = KimiRunTouchActionJSON(@"tap",
@@ -1253,14 +1289,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         }
         NSTimeInterval bksBaselineTimestamp = KimiRunCurrentBKSDispatchTimestamp();
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection tapAtX:x Y:y method:method];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection tapAtX:x Y:y method:method];
-            });
-        }
+        BOOL success = [KimiRunTouchInjection tapAtX:x Y:y method:method];
 
         if (success) {
             if (gateLocalUIDelta &&
@@ -1307,6 +1336,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         CGFloat y2 = [self floatValueFromQuery:path key:@"y2"];
         CGFloat duration = [self floatValueFromQuery:path key:@"duration"];
         NSString *method = [self stringValueFromQuery:path key:@"method"];
+        method = KimiRunRequestedOrDefaultTouchMethod(method);
         NSString *unsupportedMethodMessage = KimiRunUnsupportedTouchMethodMessage(method);
         if (unsupportedMethodMessage.length > 0) {
             NSString *json = KimiRunTouchActionJSON(@"swipe",
@@ -1362,14 +1392,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         }
         NSTimeInterval bksBaselineTimestamp = KimiRunCurrentBKSDispatchTimestamp();
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
-            });
-        }
+        BOOL success = [KimiRunTouchInjection swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
 
         if (success && gateLocalUIDelta &&
             ![self verifySpringBoardUIDeltaFromDigest:beforeLocalDigest timeout:1.0]) {
@@ -1422,6 +1445,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         CGFloat distance = [self floatValueFromQuery:path key:@"distance"];
         CGFloat duration = [self floatValueFromQuery:path key:@"duration"];
         NSString *method = [self stringValueFromQuery:path key:@"method"];
+        method = KimiRunRequestedOrDefaultTouchMethod(method);
         NSString *unsupportedMethodMessage = KimiRunUnsupportedTouchMethodMessage(method);
         if (unsupportedMethodMessage.length > 0) {
             NSString *json = KimiRunTouchActionJSON(@"scroll",
@@ -1432,6 +1456,10 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
                                                     KimiRunCurrentBKSDispatchTimestamp());
             return [self jsonResponse:400 body:json];
         }
+        BOOL strictMethod = KimiRunIsStrictExplicitTouchMethod(method);
+        BOOL forceProxyMethod = KimiRunShouldForceProxyMethod(method);
+        BOOL strictProxyOnly = KimiRunShouldUseStrictProxyOnly(method);
+        BOOL gateLocalUIDelta = strictMethod && KimiRunShouldGateLocalStrictMethodWithUIDelta(method);
         if (duration <= 0) duration = 0.35;
 
         CGRect bounds = [UIScreen mainScreen].bounds;
@@ -1465,21 +1493,71 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         x2 = ClampValue(x2, 1.0, bounds.size.width - 1.0);
         y2 = ClampValue(y2, 1.0, bounds.size.height - 1.0);
 
-        __block BOOL success = NO;
+        BOOL proxyEnabled = KimiRunTouchProxyEnabled() || forceProxyMethod;
+        NSString *strictProxyBody = nil;
+        BOOL strictProxyHadResponse = NO;
+        if (strictProxyOnly) {
+            id strictProxyResponse = [self strictProxyResponseForPath:path
+                                                              timeout:0.8
+                                                     forceProxyMethod:forceProxyMethod
+                                                verifyUIDeltaOnSuccess:strictMethod
+                                                       strictProxyBodyOut:&strictProxyBody
+                                                strictProxyHadResponseOut:&strictProxyHadResponse];
+            if (strictProxyResponse) {
+                return strictProxyResponse;
+            }
+        }
+        BOOL preferProxy = proxyEnabled && !strictMethod;
+        if (preferProxy) {
+            id proxyResponse = [self proxyTouchHTTPResponseForPath:path timeout:0.8];
+            if (proxyResponse) {
+                return proxyResponse;
+            }
+        }
+
+        NSDictionary *senderSyncFields = [self syncSenderIDFromSpringBoardProxyForStrictMethod:method];
+        NSDictionary *scrollFieldsSuccess = KimiRunMergeFields(@{@"direction": dir, @"success": @YES}, senderSyncFields);
+        NSDictionary *scrollFieldsFailure = KimiRunMergeFields(@{@"direction": dir, @"success": @NO}, senderSyncFields);
+        NSString *beforeLocalDigest = nil;
+        if (gateLocalUIDelta) {
+            beforeLocalDigest = [self springBoardScreenshotDigest];
+            if (beforeLocalDigest.length == 0) {
+                return [self jsonResponse:500 body:@"{\"status\":\"error\",\"message\":\"Unable to capture pre-dispatch UI snapshot\"}"];
+            }
+        }
         NSTimeInterval bksBaselineTimestamp = KimiRunCurrentBKSDispatchTimestamp();
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
-            });
+        BOOL success = [KimiRunTouchInjection swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
+
+        if (success && gateLocalUIDelta &&
+            ![self verifySpringBoardUIDeltaFromDigest:beforeLocalDigest timeout:1.0]) {
+            success = NO;
+        }
+
+        if (!success && !strictMethod) {
+            id proxyResponse = [self proxyTouchHTTPResponseForPath:path timeout:0.8];
+            if (proxyResponse) {
+                return proxyResponse;
+            }
+        }
+        if (!success && strictMethod && strictProxyHadResponse) {
+            return [self jsonResponse:500 body:strictProxyBody];
+        }
+
+        if (!success && gateLocalUIDelta) {
+            NSString *json = KimiRunTouchActionJSON(@"scroll",
+                                                    method,
+                                                    NO,
+                                                    scrollFieldsFailure,
+                                                    @"Strict method failed verification: no UI delta observed",
+                                                    bksBaselineTimestamp);
+            return [self jsonResponse:500 body:json];
         }
 
         if (!success) {
             NSString *json = KimiRunTouchActionJSON(@"scroll",
                                                     method,
                                                     NO,
-                                                    @{@"direction": dir, @"success": @NO},
+                                                    scrollFieldsFailure,
                                                     @"Failed to execute scroll",
                                                     bksBaselineTimestamp);
             return [self jsonResponse:500 body:json];
@@ -1488,7 +1566,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         NSString *json = KimiRunTouchActionJSON(@"scroll",
                                                 method,
                                                 YES,
-                                                @{@"direction": dir, @"success": @YES},
+                                                scrollFieldsSuccess,
                                                 nil,
                                                 bksBaselineTimestamp);
         return [self jsonResponse:200 body:json];
@@ -1501,6 +1579,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         CGFloat y2 = [self floatValueFromQuery:path key:@"y2"];
         CGFloat duration = [self floatValueFromQuery:path key:@"duration"];
         NSString *method = [self stringValueFromQuery:path key:@"method"];
+        method = KimiRunRequestedOrDefaultTouchMethod(method);
         NSString *unsupportedMethodMessage = KimiRunUnsupportedTouchMethodMessage(method);
         if (unsupportedMethodMessage.length > 0) {
             NSString *json = KimiRunTouchActionJSON(@"drag",
@@ -1553,14 +1632,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         }
         NSTimeInterval bksBaselineTimestamp = KimiRunCurrentBKSDispatchTimestamp();
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection dragFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection dragFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
-            });
-        }
+        BOOL success = [KimiRunTouchInjection dragFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:method];
 
         if (success && gateLocalUIDelta &&
             ![self verifySpringBoardUIDeltaFromDigest:beforeLocalDigest timeout:1.0]) {
@@ -1610,6 +1682,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         CGFloat x = [self floatValueFromQuery:path key:@"x"];
         CGFloat y = [self floatValueFromQuery:path key:@"y"];
         NSString *method = [self stringValueFromQuery:path key:@"method"];
+        method = KimiRunRequestedOrDefaultTouchMethod(method);
         NSString *unsupportedMethodMessage = KimiRunUnsupportedTouchMethodMessage(method);
         if (unsupportedMethodMessage.length > 0) {
             NSString *json = KimiRunTouchActionJSON(@"doubletap",
@@ -1660,14 +1733,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         }
         NSTimeInterval bksBaselineTimestamp = KimiRunCurrentBKSDispatchTimestamp();
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection doubleTapAtX:x Y:y method:method];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection doubleTapAtX:x Y:y method:method];
-            });
-        }
+        BOOL success = [KimiRunTouchInjection doubleTapAtX:x Y:y method:method];
 
         if (success && gateLocalUIDelta &&
             ![self verifySpringBoardUIDeltaFromDigest:beforeLocalDigest timeout:1.0]) {
@@ -1718,6 +1784,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         CGFloat y = [self floatValueFromQuery:path key:@"y"];
         CGFloat duration = [self floatValueFromQuery:path key:@"duration"];
         NSString *method = [self stringValueFromQuery:path key:@"method"];
+        method = KimiRunRequestedOrDefaultTouchMethod(method);
         NSString *unsupportedMethodMessage = KimiRunUnsupportedTouchMethodMessage(method);
         if (unsupportedMethodMessage.length > 0) {
             NSString *json = KimiRunTouchActionJSON(@"longpress",
@@ -1770,14 +1837,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         }
         NSTimeInterval bksBaselineTimestamp = KimiRunCurrentBKSDispatchTimestamp();
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection longPressAtX:x Y:y duration:duration method:method];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection longPressAtX:x Y:y duration:duration method:method];
-            });
-        }
+        BOOL success = [KimiRunTouchInjection longPressAtX:x Y:y duration:duration method:method];
 
         if (success && gateLocalUIDelta &&
             ![self verifySpringBoardUIDeltaFromDigest:beforeLocalDigest timeout:1.0]) {
@@ -1830,14 +1890,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
             return [self jsonResponse:400 body:json];
         }
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection typeText:text];
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection typeText:text];
-            });
-        }
+        BOOL success = [KimiRunTouchInjection typeText:text];
 
         NSString *json = [NSString stringWithFormat:
                           @"{\"status\":\"ok\",\"action\":\"type\",\"success\":%s}",
@@ -1856,19 +1909,9 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         unsigned long usage = strtoul([usageStr UTF8String], NULL, 0);
         BOOL down = downStr ? ([downStr intValue] != 0) : YES;
 
-        __block BOOL success = NO;
-        if ([NSThread isMainThread]) {
-            success = [KimiRunTouchInjection sendKeyUsage:(uint16_t)usage down:down];
-            if (!downStr) {
-                [KimiRunTouchInjection sendKeyUsage:(uint16_t)usage down:NO];
-            }
-        } else {
-            dispatch_sync(dispatch_get_main_queue(), ^{
-                success = [KimiRunTouchInjection sendKeyUsage:(uint16_t)usage down:down];
-                if (!downStr) {
-                    [KimiRunTouchInjection sendKeyUsage:(uint16_t)usage down:NO];
-                }
-            });
+        BOOL success = [KimiRunTouchInjection sendKeyUsage:(uint16_t)usage down:down];
+        if (!downStr) {
+            [KimiRunTouchInjection sendKeyUsage:(uint16_t)usage down:NO];
         }
 
         NSString *json = [NSString stringWithFormat:
@@ -2024,107 +2067,30 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
     }
 
     if ([routePath isEqualToString:@"/screenshot/file"]) {
-        NSString *format = [self stringValueFromQuery:path key:@"format"];
-        NSString *qualityStr = [self stringValueFromQuery:path key:@"quality"];
-        __block NSString *lower = format ? [format lowercaseString] : @"png";
-        __block NSData *data = nil;
-
-        // Prefer SpringBoard proxy to avoid daemon capture crashes.
-        NSData *proxyData = [self fetchSpringBoardScreenshotData];
-        if (proxyData.length > 0) {
-            if ([lower isEqualToString:@"jpeg"] || [lower isEqualToString:@"jpg"]) {
-                __block NSData *jpeg = nil;
-                if ([NSThread isMainThread]) {
-                    UIImage *img = [UIImage imageWithData:proxyData];
-                    CGFloat quality = 0.8;
-                    if (qualityStr && qualityStr.length > 0) {
-                        quality = (CGFloat)[qualityStr doubleValue];
-                    }
-                    jpeg = img ? UIImageJPEGRepresentation(img, quality) : nil;
-                } else {
-                    dispatch_sync(dispatch_get_main_queue(), ^{
-                        UIImage *img = [UIImage imageWithData:proxyData];
-                        CGFloat quality = 0.8;
-                        if (qualityStr && qualityStr.length > 0) {
-                            quality = (CGFloat)[qualityStr doubleValue];
-                        }
-                        jpeg = img ? UIImageJPEGRepresentation(img, quality) : nil;
-                    });
-                }
-                data = jpeg ?: proxyData;
-                lower = @"jpg";
-            } else {
-                data = proxyData;
-                lower = @"png";
-            }
-        } else {
-            // Fallback to local capture if proxy fails.
-            if ([NSThread isMainThread]) {
-                if ([lower isEqualToString:@"jpeg"] || [lower isEqualToString:@"jpg"]) {
-                    CGFloat quality = 0.8;
-                    if (qualityStr && qualityStr.length > 0) {
-                        quality = (CGFloat)[qualityStr doubleValue];
-                    }
-                    data = [[KimiRunScreenshot sharedScreenshot] captureScreenAsJPEGWithQuality:quality];
-                    lower = @"jpg";
-                } else {
-                    data = [[KimiRunScreenshot sharedScreenshot] captureScreenAsPNG];
-                    lower = @"png";
-                }
-            } else {
-                dispatch_sync(dispatch_get_main_queue(), ^{
-                    if ([lower isEqualToString:@"jpeg"] || [lower isEqualToString:@"jpg"]) {
-                        CGFloat quality = 0.8;
-                        if (qualityStr && qualityStr.length > 0) {
-                            quality = (CGFloat)[qualityStr doubleValue];
-                        }
-                        data = [[KimiRunScreenshot sharedScreenshot] captureScreenAsJPEGWithQuality:quality];
-                        lower = @"jpg";
-                    } else {
-                        data = [[KimiRunScreenshot sharedScreenshot] captureScreenAsPNG];
-                        lower = @"png";
-                    }
-                });
+        NSUInteger resolvedPort = 0;
+        NSString *proxyBody = [self proxyTouchResponseForPath:path timeout:1.0 resolvedPortOut:&resolvedPort];
+        if (proxyBody.length > 0) {
+            return [self jsonResponse:200 body:proxyBody];
+        }
+        NSData *png = [self fetchSpringBoardScreenshotData];
+        if (png.length > 0) {
+            NSTimeInterval ts = [[NSDate date] timeIntervalSince1970];
+            NSString *filePath = [NSString stringWithFormat:@"/tmp/kimirun_daemon_screen_%.0f.png", ts];
+            if ([png writeToFile:filePath atomically:YES]) {
+                NSString *json = [NSString stringWithFormat:
+                                  @"{\"status\":\"ok\",\"path\":\"%@\",\"bytes\":%lu,\"format\":\"png\"}",
+                                  filePath,
+                                  (unsigned long)png.length];
+                return [self jsonResponse:200 body:json];
             }
         }
-
-        if (!data) {
-            NSString *json = @"{\"status\":\"error\",\"message\":\"Failed to capture screenshot\"}";
-            return [self jsonResponse:500 body:json];
-        }
-
-        NSTimeInterval ts = [[NSDate date] timeIntervalSince1970];
-        NSString *pathOut = [NSString stringWithFormat:@"/tmp/kimirun_daemon_%.0f.%@", ts, lower];
-        BOOL ok = [data writeToFile:pathOut atomically:YES];
-        if (!ok) {
-            NSString *json = @"{\"status\":\"error\",\"message\":\"Failed to write screenshot\"}";
-            return [self jsonResponse:500 body:json];
-        }
-
-        NSString *json = [NSString stringWithFormat:
-                          @"{\"status\":\"ok\",\"path\":\"%@\",\"bytes\":%lu,\"format\":\"%@\"}",
-                          pathOut, (unsigned long)data.length, lower];
-        return [self jsonResponse:200 body:json];
+        NSString *json = @"{\"status\":\"error\",\"message\":\"Proxy screenshot unavailable\"}";
+        return [self jsonResponse:500 body:json];
     }
 
     if ([routePath isEqualToString:@"/screenshot"]) {
-        NSData *data = [self fetchSpringBoardScreenshotData];
-        if (!data) {
-            __block NSData *fallback = nil;
-            if ([NSThread isMainThread]) {
-                fallback = [[KimiRunScreenshot sharedScreenshot] captureScreenAsPNG];
-            } else {
-                dispatch_sync(dispatch_get_main_queue(), ^{
-                    fallback = [[KimiRunScreenshot sharedScreenshot] captureScreenAsPNG];
-                });
-            }
-            data = fallback;
-        }
-        if (!data) {
-            NSString *json = @"{\"success\":false,\"error\":\"Failed to capture screenshot\"}";
-            return [self jsonResponse:500 body:json];
-        }
-        return [self binaryResponse:200 contentType:@"image/png" body:data];
+        NSString *json = @"{\"success\":false,\"error\":\"/screenshot disabled on low-memory daemon; use /screenshot/file\"}";
+        return [self jsonResponse:503 body:json];
     }
 
     if ([routePath isEqualToString:@"/a11y/interactive"]) {
@@ -2355,7 +2321,11 @@ static void DaemonSocketCallback(CFSocketRef s, CFSocketCallBackType type, CFDat
     if (type != kCFSocketAcceptCallBack) return;
     DaemonHTTPServer *server = (__bridge DaemonHTTPServer *)info;
     CFSocketNativeHandle nativeSocket = *(CFSocketNativeHandle *)data;
-    [server handleConnection:nativeSocket];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            [server handleConnection:nativeSocket];
+        }
+    });
 }
 
 static CGFloat ClampValue(CGFloat value, CGFloat minValue, CGFloat maxValue) {

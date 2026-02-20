@@ -10,8 +10,9 @@ import socket
 import subprocess
 import time
 import base64
+import hashlib
 import httpx
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from mcp.types import Tool, TextContent, ImageContent
 
 # AuiTO API configuration from environment or defaults.
@@ -21,6 +22,7 @@ KIMIRUN_PORT = int(os.environ.get("AUITO_PORT", os.environ.get("KIMIRUN_PORT", "
 BASE_URL = f"http://{KIMIRUN_HOST}:{KIMIRUN_PORT}"
 
 _TUNNEL_STATE = {"proc": None, "local_port": None, "key": None}
+_DAEMON_STATE = {"proc": None, "bin": None}
 
 
 def _is_truthy(value: str) -> bool:
@@ -35,6 +37,79 @@ def _pick_free_port() -> int:
     _, port = s.getsockname()
     s.close()
     return int(port)
+
+
+def _parse_ports(value: str) -> List[int]:
+    ports: List[int] = []
+    if not value:
+        return ports
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            port = int(token)
+        except ValueError:
+            continue
+        if 0 < port < 65536 and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _is_local_host(host: str) -> bool:
+    if not host:
+        return False
+    lowered = host.strip().lower()
+    return lowered in {"127.0.0.1", "localhost", "::1"}
+
+
+def _http_ping_ok(host: str, port: int, timeout: float = 1.0) -> bool:
+    url = f"http://{host}:{int(port)}/ping"
+    try:
+        r = httpx.get(url, timeout=timeout)
+        return r.status_code < 500
+    except Exception:
+        return False
+
+
+def _start_local_daemon_if_needed(host: str) -> bool:
+    """Best-effort local daemon start. Returns True if a process was started."""
+    if not _is_local_host(host):
+        return False
+    if not _is_truthy(os.environ.get("AUITO_AUTOSTART_DAEMON", "1")):
+        return False
+
+    daemon_bin = os.environ.get("AUITO_DAEMON_BIN", "/usr/bin/auito-daemon").strip() or "/usr/bin/auito-daemon"
+    if not os.path.exists(daemon_bin):
+        return False
+
+    proc = _DAEMON_STATE.get("proc")
+    if proc and proc.poll() is None:
+        return False
+
+    try:
+        proc = subprocess.Popen(
+            [daemon_bin],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        return False
+
+    _DAEMON_STATE["proc"] = proc
+    _DAEMON_STATE["bin"] = daemon_bin
+
+    def _cleanup():
+        p = _DAEMON_STATE.get("proc")
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    atexit.register(_cleanup)
+    return True
 
 
 class KimiRunDeviceClient:
@@ -53,6 +128,7 @@ class KimiRunDeviceClient:
             self._ensure_ssh_tunnel()
             self.base_url = f"http://127.0.0.1:{self.local_port}"
         else:
+            self._resolve_working_port()
             self.base_url = f"http://{self.host}:{self.port}"
 
         self.client = httpx.Client(base_url=self.base_url, timeout=30.0)
@@ -77,6 +153,30 @@ class KimiRunDeviceClient:
         if token:
             headers["X-Auth-Token"] = token
         return headers
+
+    def _resolve_working_port(self) -> None:
+        """Pick the first responsive endpoint from configured and fallback ports."""
+        configured = [self.port]
+        fallback = _parse_ports(os.environ.get("AUITO_FALLBACK_PORTS", "8876,8765,8080"))
+        candidates: List[int] = []
+        for p in configured + fallback:
+            if p not in candidates:
+                candidates.append(p)
+
+        for p in candidates:
+            if _http_ping_ok(self.host, p, timeout=1.0):
+                self.port = p
+                return
+
+        started = _start_local_daemon_if_needed(self.host)
+        if started:
+            time.sleep(0.3)
+            for p in candidates:
+                if _http_ping_ok(self.host, p, timeout=1.5):
+                    self.port = p
+                    return
+
+        # Keep configured port if nothing responded; request handlers will surface the error.
 
     def _ensure_ssh_tunnel(self) -> None:
         global _TUNNEL_STATE
@@ -142,7 +242,10 @@ class DeviceToolRegistry:
     
     def __init__(self, client: KimiRunDeviceClient = None):
         self.client = client or KimiRunDeviceClient()
-        self.daemon_port = int(os.environ.get("AUITO_DAEMON_PORT", "8876"))
+        self.daemon_port = int(os.environ.get("AUITO_DAEMON_PORT", str(self.client.port)))
+        self._last_screenshot_hash: Optional[str] = None
+        self._last_screenshot_bytes: int = 0
+        self._stale_screenshot_count: int = 0
 
     @staticmethod
     def _is_strict_non_ax_method(method: str) -> bool:
@@ -181,7 +284,7 @@ class DeviceToolRegistry:
                     "properties": {
                         "x": {"type": "number", "description": "X coordinate"},
                         "y": {"type": "number", "description": "Y coordinate"},
-                        "method": {"type": "string", "description": "Touch method override (e.g., auto, ax, zxtouch, bks, sim, legacy)"},
+                        "method": {"type": "string", "description": "Touch method override (e.g., auto, direct, ax, zxtouch, bks, sim, legacy)"},
                         "pixel": {"type": "boolean", "description": "Treat coordinates as pixels", "default": False}
                     },
                     "required": ["x", "y"]
@@ -214,7 +317,7 @@ class DeviceToolRegistry:
                         "endX": {"type": "number", "description": "End X coordinate"},
                         "endY": {"type": "number", "description": "End Y coordinate"},
                         "duration": {"type": "number", "description": "Swipe duration in milliseconds", "default": 500},
-                        "method": {"type": "string", "description": "Touch method override (e.g., auto, ax, zxtouch, bks, sim, legacy)"},
+                        "method": {"type": "string", "description": "Touch method override (e.g., auto, direct, ax, zxtouch, bks, sim, legacy)"},
                         "pixel": {"type": "boolean", "description": "Treat coordinates as pixels", "default": False},
                         "scroll": {"type": "boolean", "description": "Prefer scroll semantics (if supported)", "default": False}
                     },
@@ -334,63 +437,107 @@ class DeviceToolRegistry:
     
     async def handle_tool_call(self, name: str, arguments: dict) -> List[TextContent]:
         """Handle device tool calls by mapping to KimiRun HTTP API endpoints."""
+        return await self._handle_tool_call_internal(name, arguments, retry_on_connect_error=True)
+
+    async def _handle_tool_call_internal(
+        self,
+        name: str,
+        arguments: dict,
+        retry_on_connect_error: bool,
+    ) -> List[TextContent]:
         try:
-            if name == "device_ping":
-                return await self._handle_ping()
-            elif name == "device_state":
-                return await self._handle_state()
-            elif name == "device_tap":
-                return await self._handle_tap(arguments)
-            elif name == "device_screenshot":
-                return await self._handle_screenshot()
-            elif name == "device_type_text":
-                return await self._handle_type_text(arguments)
-            elif name == "device_swipe":
-                return await self._handle_swipe(arguments)
-            elif name == "device_press_home":
-                return await self._handle_press_home()
-            elif name == "device_launch_app":
-                return await self._handle_launch_app(arguments)
-            elif name == "device_get_ui_hierarchy":
-                return await self._handle_ui_hierarchy()
-            elif name == "device_list_apps":
-                return await self._handle_list_apps(arguments)
-            elif name == "device_get_screen_size":
-                return await self._handle_screen_size()
-            elif name == "device_a11y_interactive":
-                return await self._handle_a11y_interactive(arguments)
-            elif name == "device_a11y_activate":
-                return await self._handle_a11y_activate(arguments)
-            elif name == "device_a11y_overlay":
-                return await self._handle_a11y_overlay(arguments)
-            elif name == "device_settings_safe_activate":
-                return await self._handle_settings_safe_activate(arguments)
-            elif name == "device_touch_senderid":
-                return await self._handle_touch_senderid()
-            elif name == "device_touch_senderid_set":
-                return await self._handle_touch_senderid_set(arguments)
-            elif name == "device_touch_bkhid_selectors":
-                return await self._handle_touch_bkhid_selectors()
-            elif name == "device_touch_forcefocus":
-                return await self._handle_touch_forcefocus()
-            else:
-                return [TextContent(type="text", text=f"Unknown tool: {name}")]
-        
-        except httpx.ConnectError as e:
+            return await self._dispatch_tool(name, arguments)
+        except httpx.ConnectError:
+            if retry_on_connect_error and self._recover_connection():
+                return await self._handle_tool_call_internal(
+                    name,
+                    arguments,
+                    retry_on_connect_error=False,
+                )
             return [TextContent(type="text", text=f"Connection error: Cannot reach KimiRun device at {self.client.get_base_url()}. Is the device online?")]
-        except httpx.TimeoutException as e:
+        except httpx.TimeoutException:
             return [TextContent(type="text", text=f"Timeout error: Request to {self.client.get_base_url()} timed out.")]
         except Exception as e:
             return [TextContent(type="text", text=f"Error: {type(e).__name__}: {str(e)}")]
+
+    async def _dispatch_tool(self, name: str, arguments: dict) -> List[TextContent]:
+        if name == "device_ping":
+            return await self._handle_ping()
+        elif name == "device_state":
+            return await self._handle_state()
+        elif name == "device_tap":
+            return await self._handle_tap(arguments)
+        elif name == "device_screenshot":
+            return await self._handle_screenshot()
+        elif name == "device_type_text":
+            return await self._handle_type_text(arguments)
+        elif name == "device_swipe":
+            return await self._handle_swipe(arguments)
+        elif name == "device_press_home":
+            return await self._handle_press_home()
+        elif name == "device_launch_app":
+            return await self._handle_launch_app(arguments)
+        elif name == "device_get_ui_hierarchy":
+            return await self._handle_ui_hierarchy()
+        elif name == "device_list_apps":
+            return await self._handle_list_apps(arguments)
+        elif name == "device_get_screen_size":
+            return await self._handle_screen_size()
+        elif name == "device_a11y_interactive":
+            return await self._handle_a11y_interactive(arguments)
+        elif name == "device_a11y_activate":
+            return await self._handle_a11y_activate(arguments)
+        elif name == "device_a11y_overlay":
+            return await self._handle_a11y_overlay(arguments)
+        elif name == "device_settings_safe_activate":
+            return await self._handle_settings_safe_activate(arguments)
+        elif name == "device_touch_senderid":
+            return await self._handle_touch_senderid()
+        elif name == "device_touch_senderid_set":
+            return await self._handle_touch_senderid_set(arguments)
+        elif name == "device_touch_bkhid_selectors":
+            return await self._handle_touch_bkhid_selectors()
+        elif name == "device_touch_forcefocus":
+            return await self._handle_touch_forcefocus()
+        return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+    def _recover_connection(self) -> bool:
+        """Best-effort reconnect: re-resolve ports and restart local daemon when possible."""
+        previous_base = self.client.get_base_url()
+        if self.client.use_ssh_tunnel:
+            try:
+                self.client._ensure_ssh_tunnel()
+            except Exception:
+                return False
+        else:
+            self.client._resolve_working_port()
+            new_base = f"http://{self.client.host}:{self.client.port}"
+            if new_base != previous_base:
+                try:
+                    self.client.client.close()
+                except Exception:
+                    pass
+                self.client.base_url = new_base
+                self.client.client = httpx.Client(base_url=self.client.base_url, timeout=30.0)
+            if "AUITO_DAEMON_PORT" not in os.environ:
+                self.daemon_port = int(self.client.port)
+
+        return _http_ping_ok(self.client.host, self.client.port, timeout=1.2)
     
     async def _handle_ping(self) -> List[TextContent]:
         """Handle device_ping tool"""
-        response = self.client.get("/ping")
+        try:
+            response = self._daemon_get("/ping")
+        except Exception:
+            response = self.client.get("/ping")
         return [TextContent(type="text", text=f"Device status: {response.text}")]
 
     async def _handle_state(self) -> List[TextContent]:
         """Handle device_state tool"""
-        response = self.client.get("/state")
+        try:
+            response = self._daemon_get("/state")
+        except Exception:
+            response = self.client.get("/state")
         return [TextContent(type="text", text=response.text)]
     
     async def _handle_tap(self, arguments: dict) -> List[TextContent]:
@@ -405,6 +552,17 @@ class DeviceToolRegistry:
             params = {"x": x, "y": y, "method": method}
             response = self._daemon_get("/tap", params=params)
             return [TextContent(type="text", text=f"Tapped at ({x}, {y}) [strict-daemon]: {response.text}")]
+
+        # Prefer daemon /tap first so default behavior uses real touch injection.
+        params = {"x": x, "y": y}
+        if isinstance(method, str) and method.strip():
+            params["method"] = method
+        try:
+            response = self._daemon_get("/tap", params=params)
+            if response.status_code != 404 and "Not Found" not in (response.text or ""):
+                return [TextContent(type="text", text=f"Tapped at ({x}, {y}) [daemon]: {response.text}")]
+        except Exception:
+            pass
 
         # Prefer /touch/tap (iOSRunPortal-style) if available
         payload = {"x": x, "y": y}
@@ -427,16 +585,23 @@ class DeviceToolRegistry:
         except Exception:
             pass
 
-        # Fallback to /tap (KimiRun daemon)
-        params = {"x": x, "y": y}
-        if isinstance(method, str) and method.strip():
-            params["method"] = method
+        # Fallback to /tap on the active base URL.
         response = self.client.get("/tap", params=params)
         return [TextContent(type="text", text=f"Tapped at ({x}, {y}): {response.text}")]
     
     async def _handle_screenshot(self) -> List[TextContent]:
         """Handle device_screenshot tool"""
-        response = self.client.get("/screenshot")
+        file_first = await self._handle_screenshot_file_fallback(
+            reason="preferred low-memory file screenshot path",
+            return_image=True,
+        )
+        if any(isinstance(item, ImageContent) for item in file_first):
+            return file_first
+
+        try:
+            response = self._daemon_get("/screenshot")
+        except Exception:
+            response = self.client.get("/screenshot")
         content_type = (response.headers.get("content-type") or "").lower()
 
         # New daemon behavior: /screenshot can return raw image/png bytes.
@@ -478,12 +643,15 @@ class DeviceToolRegistry:
             err = data.get("message")
         return await self._handle_screenshot_file_fallback(reason=err or "Unknown error")
 
-    async def _handle_screenshot_file_fallback(self, reason: str) -> List[TextContent]:
+    async def _handle_screenshot_file_fallback(self, reason: str, return_image: bool = False) -> List[TextContent]:
         """Fallback to /screenshot/file to avoid huge base64 payloads."""
         fmt = os.environ.get("KIMIRUN_SCREENSHOT_FILE_FORMAT", "png").lower()
         quality = os.environ.get("KIMIRUN_SCREENSHOT_FILE_QUALITY", "0.6")
         params = {"format": fmt, "quality": quality}
-        response = self.client.get("/screenshot/file", params=params)
+        try:
+            response = self._daemon_get("/screenshot/file", params=params)
+        except Exception:
+            response = self.client.get("/screenshot/file", params=params)
         try:
             data = response.json()
         except Exception:
@@ -492,6 +660,51 @@ class DeviceToolRegistry:
         if isinstance(data, dict) and data.get("status") == "ok":
             path = data.get("path", "")
             bytes_len = data.get("bytes", 0)
+            if return_image and isinstance(path, str) and path:
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                    if raw:
+                        digest = hashlib.sha1(raw).hexdigest()
+                        if digest == self._last_screenshot_hash and len(raw) == self._last_screenshot_bytes:
+                            self._stale_screenshot_count += 1
+                        else:
+                            self._stale_screenshot_count = 0
+                        self._last_screenshot_hash = digest
+                        self._last_screenshot_bytes = len(raw)
+
+                        mime = "image/png"
+                        out_fmt = str(data.get("format", fmt)).lower()
+                        if out_fmt in {"jpg", "jpeg"}:
+                            mime = "image/jpeg"
+                        payload = base64.b64encode(raw).decode("ascii")
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
+                        msg = f"Screenshot captured via file path ({len(raw)} bytes)"
+                        out = [TextContent(type="text", text=msg)]
+                        if self._stale_screenshot_count >= 2:
+                            ui_tree = self._fetch_ui_tree()
+                            if self._is_switcher_tree(ui_tree):
+                                labels = self._switcher_card_labels(ui_tree)
+                                label_hint = f" cards={labels}" if labels else ""
+                                out.append(TextContent(
+                                    type="text",
+                                    text=(
+                                        f"Warning: stale screenshot repeated {self._stale_screenshot_count + 1}x "
+                                        f"while App Switcher is active ({label_hint.strip()}). "
+                                        f"Try `device_press_home` to run recovery sequence."
+                                    ),
+                                ))
+                        out.append(ImageContent(type="image", data=payload, mimeType=mime))
+                        return out
+                except Exception as e:
+                    return [
+                        TextContent(type="text", text=f"Screenshot fallback used: {reason}"),
+                        TextContent(type="text", text=f"Saved to {path} ({bytes_len} bytes, {data.get('format', '')})"),
+                        TextContent(type="text", text=f"Readback failed: {type(e).__name__}: {e}"),
+                    ]
             return [
                 TextContent(type="text", text=f"Screenshot fallback used: {reason}"),
                 TextContent(type="text", text=f"Saved to {path} ({bytes_len} bytes, {data.get('format', '')})")
@@ -500,12 +713,21 @@ class DeviceToolRegistry:
         err = data.get("error") if isinstance(data, dict) else None
         if not err and isinstance(data, dict):
             err = data.get("message")
+        if isinstance(err, str) and "Proxy screenshot unavailable" in err:
+            return [
+                TextContent(type="text", text=f"Screenshot failed: {reason}."),
+                TextContent(type="text", text="Daemon screenshot proxy is unavailable (no active SpringBoard/app screenshot endpoint)."),
+                TextContent(type="text", text="To restore screenshots, run a SpringBoard proxy server on port 8765 (or app proxy on 8766/8767)."),
+            ]
         return [TextContent(type="text", text=f"Screenshot failed: {reason}. Fallback error: {err or 'Unknown error'}")]
     
     async def _handle_type_text(self, arguments: dict) -> List[TextContent]:
         """Handle device_type_text tool"""
         text = arguments.get("text", "")
-        response = self.client.get("/keyboard/type", params={"text": text})
+        try:
+            response = self._daemon_get("/keyboard/type", params={"text": text})
+        except Exception:
+            response = self.client.get("/keyboard/type", params={"text": text})
         return [TextContent(type="text", text=f"Typed text: {response.text}")]
     
     async def _handle_swipe(self, arguments: dict) -> List[TextContent]:
@@ -528,6 +750,23 @@ class DeviceToolRegistry:
             }
             response = self._daemon_get("/swipe", params=params)
             return [TextContent(type="text", text=f"Swiped [strict-daemon]: {response.text}")]
+
+        # Prefer daemon /swipe first so default behavior uses real swipe injection.
+        params = {
+            "x1": arguments.get("startX"),
+            "y1": arguments.get("startY"),
+            "x2": arguments.get("endX"),
+            "y2": arguments.get("endY"),
+            "duration": duration,
+        }
+        if isinstance(method, str) and method.strip():
+            params["method"] = method
+        try:
+            response = self._daemon_get("/swipe", params=params)
+            if response.status_code != 404 and "Not Found" not in (response.text or ""):
+                return [TextContent(type="text", text=f"Swiped [daemon]: {response.text}")]
+        except Exception:
+            pass
 
         # Prefer /touch/swipe (iOSRunPortal-style) if available
         payload = {
@@ -558,29 +797,63 @@ class DeviceToolRegistry:
         except Exception:
             pass
 
-        # Fallback to /swipe (KimiRun daemon)
-        params = {
-            "x1": arguments.get("startX"),
-            "y1": arguments.get("startY"),
-            "x2": arguments.get("endX"),
-            "y2": arguments.get("endY"),
-            "duration": duration,
-        }
-        if isinstance(method, str) and method.strip():
-            params["method"] = method
+        # Fallback to /swipe on the active base URL.
         response = self.client.get("/swipe", params=params)
         return [TextContent(type="text", text=f"Swiped: {response.text}")]
     
     async def _handle_press_home(self) -> List[TextContent]:
         """Handle device_press_home tool"""
-        return [TextContent(type="text", text="Home button not supported by daemon API")]
+        out: List[TextContent] = []
+
+        try:
+            response = self._daemon_get("/home")
+            if response.status_code < 400 and "Not Found" not in (response.text or ""):
+                out.append(TextContent(type="text", text=f"Home pressed [daemon]: {response.text}"))
+                return out
+        except Exception:
+            pass
+
+        width, height = self._screen_dimensions()
+        x = max(10, int(width * 0.5))
+        y_start = max(10, int(height * 0.97))
+        y_end = max(10, int(height * 0.70))
+        params = {"x1": x, "y1": y_start, "x2": x, "y2": y_end, "duration": 0.22}
+
+        try:
+            response = self._daemon_get("/swipe", params=params)
+            out.append(TextContent(type="text", text=f"Home gesture [daemon swipe]: {response.text}"))
+        except Exception:
+            try:
+                response = self.client.get("/swipe", params=params)
+                out.append(TextContent(type="text", text=f"Home gesture [fallback swipe]: {response.text}"))
+            except Exception as e:
+                return [TextContent(type="text", text=f"Home action failed: {type(e).__name__}: {e}")]
+
+        ui_tree = self._fetch_ui_tree()
+        if self._is_switcher_tree(ui_tree):
+            labels = self._switcher_card_labels(ui_tree)
+            label_hint = f" cards={labels}" if labels else ""
+            out.append(TextContent(
+                type="text",
+                text=f"Switcher still active after home gesture ({label_hint.strip()}). Running recovery taps/swipes.",
+            ))
+            recovered, note = self._recover_from_switcher(width=width, height=height)
+            out.append(TextContent(
+                type="text",
+                text=f"Switcher recovery: {'recovered' if recovered else 'not recovered'} ({note})",
+            ))
+
+        return out
     
     async def _handle_launch_app(self, arguments: dict) -> List[TextContent]:
         """Handle device_launch_app tool"""
         bundle_id = arguments.get("bundle_id", "")
-        response = self.client.get("/app/launch", params={"bundleID": bundle_id})
-        if response.status_code >= 400 or "Not Found" in (response.text or ""):
+        try:
             response = self._daemon_get("/app/launch", params={"bundleID": bundle_id})
+        except Exception:
+            response = self.client.get("/app/launch", params={"bundleID": bundle_id})
+        if response.status_code >= 400 or "Not Found" in (response.text or ""):
+            response = self.client.get("/app/launch", params={"bundleID": bundle_id})
         return [TextContent(type="text", text=f"Launch app '{bundle_id}': {response.text}")]
     
     async def _handle_ui_hierarchy(self) -> List[TextContent]:
@@ -594,8 +867,20 @@ class DeviceToolRegistry:
             return [TextContent(type="text", text="UI hierarchy failed: Invalid JSON response")]
         if data.get("success"):
             import json
-            hierarchy = json.dumps(data.get("data", {}), indent=2)
-            return [TextContent(type="text", text=f"UI Hierarchy:\n{hierarchy}")]
+            tree = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+            hierarchy = json.dumps(tree, indent=2)
+            out = [TextContent(type="text", text=f"UI Hierarchy:\n{hierarchy}")]
+            if self._is_switcher_tree(tree):
+                labels = self._switcher_card_labels(tree)
+                label_hint = f" cards={labels}" if labels else ""
+                out.append(TextContent(
+                    type="text",
+                    text=(
+                        f"Warning: App Switcher is foreground ({label_hint.strip()}). "
+                        "Capture and touch may target snapshot cards instead of a live app."
+                    ),
+                ))
+            return out
         else:
             return [TextContent(type="text", text=f"UI hierarchy failed: {data.get('error', 'Unknown error')}")]
     
@@ -671,6 +956,17 @@ class DeviceToolRegistry:
             if target_labels.issubset(labels):
                 return True
 
+            if items:
+                process_names = {(it.get("processName") or "").strip() for it in items}
+                if process_names == {"SpringBoard"} and not target_labels.intersection(labels):
+                    try:
+                        self._daemon_get("/app/launch", params={"bundleID": "com.apple.Preferences"})
+                    except Exception:
+                        self.client.get("/app/launch", params={"bundleID": "com.apple.Preferences"})
+                    self.client.get("/tap", params={"x": 188, "y": 406})
+                    time.sleep(0.2)
+                    continue
+
             back_index = None
             for it in items:
                 label = it.get("label") or ""
@@ -686,6 +982,127 @@ class DeviceToolRegistry:
                 self.client.get("/tap", params={"x": 30, "y": 90})
 
         return False
+
+    def _screen_dimensions(self) -> tuple[int, int]:
+        width, height = 375, 812
+        try:
+            response = self.client.get("/screen")
+            data = self._json_or_none(response)
+            if isinstance(data, dict) and data.get("success"):
+                payload = data.get("data", {}) or {}
+                width = int(payload.get("width", width))
+                height = int(payload.get("height", height))
+                return width, height
+        except Exception:
+            pass
+
+        try:
+            response = self._daemon_get("/screen")
+            data = self._json_or_none(response)
+            if isinstance(data, dict) and data.get("success"):
+                payload = data.get("data", {}) or {}
+                width = int(payload.get("width", width))
+                height = int(payload.get("height", height))
+        except Exception:
+            pass
+
+        return width, height
+
+    def _fetch_ui_tree(self) -> dict:
+        """Best-effort UI tree fetch for health checks/recovery decisions."""
+        try:
+            response = self.client.get("/uiHierarchy")
+            data = self._json_or_none(response)
+            if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
+                return data.get("data", {})
+        except Exception:
+            pass
+
+        try:
+            response = self._daemon_get("/uiHierarchy")
+            data = self._json_or_none(response)
+            if isinstance(data, dict) and data.get("success") and isinstance(data.get("data"), dict):
+                return data.get("data", {})
+        except Exception:
+            pass
+
+        return {}
+
+    def _tree_nodes(self, node):
+        if isinstance(node, dict):
+            yield node
+            children = node.get("children")
+            if isinstance(children, list):
+                for child in children:
+                    yield from self._tree_nodes(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from self._tree_nodes(child)
+
+    def _is_switcher_tree(self, tree: dict) -> bool:
+        if not isinstance(tree, dict):
+            return False
+        for node in self._tree_nodes(tree):
+            class_name = str(node.get("className", ""))
+            identifier = str(node.get("identifier", ""))
+            if class_name in {"SBMainSwitcherWindow", "SBFluidSwitcherContentView"}:
+                return True
+            if identifier in {"SBSwitcherWindow", "AppSwitcherContentView"}:
+                return True
+        return False
+
+    def _switcher_card_labels(self, tree: dict) -> List[str]:
+        labels: List[str] = []
+        if not isinstance(tree, dict):
+            return labels
+        for node in self._tree_nodes(tree):
+            class_name = str(node.get("className", ""))
+            label = str(node.get("label", "")).strip()
+            if class_name == "SBReusableSnapshotItemContainer" and label and label not in labels:
+                labels.append(label)
+        return labels[:6]
+
+    def _best_effort_get(self, path: str, params: dict) -> None:
+        try:
+            self._daemon_get(path, params=params)
+            return
+        except Exception:
+            pass
+        try:
+            self.client.get(path, params=params)
+        except Exception:
+            pass
+
+    def _recover_from_switcher(self, width: int, height: int) -> tuple[bool, str]:
+        """
+        Best-effort exit sequence for iOS app switcher.
+        Returns (recovered, note).
+        """
+        cx = max(10, int(width * 0.5))
+        cy = max(10, int(height * 0.5))
+        y_bottom = max(10, int(height * 0.97))
+        y_short = max(10, int(height * 0.86))
+        y_lower_tap = max(10, int(height * 0.88))
+
+        # 1) Tap focused card center (open app from switcher)
+        self._best_effort_get("/tap", {"x": cx, "y": cy, "method": "ax"})
+        time.sleep(0.12)
+        if not self._is_switcher_tree(self._fetch_ui_tree()):
+            return True, "card-center tap"
+
+        # 2) Short home swipe (dismiss switcher to home on gesture devices)
+        self._best_effort_get("/swipe", {"x1": cx, "y1": y_bottom, "x2": cx, "y2": y_short, "duration": 0.14})
+        time.sleep(0.12)
+        if not self._is_switcher_tree(self._fetch_ui_tree()):
+            return True, "short home swipe"
+
+        # 3) Bottom-area tap fallback
+        self._best_effort_get("/tap", {"x": cx, "y": y_lower_tap, "method": "ax"})
+        time.sleep(0.12)
+        if not self._is_switcher_tree(self._fetch_ui_tree()):
+            return True, "bottom-area tap"
+
+        return False, "all switcher-exit gestures failed"
 
     async def _handle_a11y_interactive(self, arguments: dict) -> List[TextContent]:
         compact = arguments.get("compact", True)
@@ -716,6 +1133,11 @@ class DeviceToolRegistry:
     async def _handle_settings_safe_activate(self, arguments: dict) -> List[TextContent]:
         index = int(arguments.get("index"))
         max_steps = int(arguments.get("max_steps", 6))
+        try:
+            self._daemon_get("/app/launch", params={"bundleID": "com.apple.Preferences"})
+        except Exception:
+            self.client.get("/app/launch", params={"bundleID": "com.apple.Preferences"})
+        time.sleep(0.2)
         ok = self._ensure_settings_root(max_steps=max_steps)
         response = self.client.get("/a11y/activate", params={"index": index})
         return [TextContent(type="text", text=f"Root OK={ok}. Activated index {index}: {response.text}")]

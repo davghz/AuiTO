@@ -46,11 +46,9 @@ static BOOL KimiRunEnvBool(const char *key, BOOL defaultValue) {
 }
 
 static BOOL KimiRunForceAXEnabled(void) {
-    // Default to AX on-device unless explicitly disabled.
-    // Non-AX paths can still be tested by setting KIMIRUN_FORCE_AX=0
-    // or preference ForceAX=false.
+    // Real touch injection is the default. Enable this explicitly to force AX.
     return KimiRunEnvBool("KIMIRUN_FORCE_AX",
-                          KimiRunPrefBool(@"ForceAX", YES));
+                          KimiRunPrefBool(@"ForceAX", NO));
 }
 
 static NSString *KimiRunDefaultMethod(void) {
@@ -58,7 +56,13 @@ static NSString *KimiRunDefaultMethod(void) {
     if (env && env[0] != '\0') {
         return [NSString stringWithUTF8String:env];
     }
-    return KimiRunPrefString(@"TouchMethod");
+    NSString *pref = KimiRunPrefString(@"TouchMethod");
+    if ([pref isKindOfClass:[NSString class]] && pref.length > 0) {
+        return pref;
+    }
+    // Safety-first default: keep auto paths on AX unless an explicit
+    // non-AX method is requested.
+    return @"ax";
 }
 
 static NSString *KimiRunResolveMethod(NSString *method) {
@@ -71,10 +75,20 @@ static NSString *KimiRunResolveMethod(NSString *method) {
             if ([lowerRequested isEqualToString:@"direct"]) {
                 return @"direct";
             }
-            // Preserve explicit routing requests even when ForceAX is enabled.
-            // This allows strict method validation for sim/legacy/bks/zx paths.
-            if ([lowerRequested isEqualToString:@"auto"] && KimiRunForceAXEnabled()) {
-                return @"ax";
+            if ([lowerRequested isEqualToString:@"auto"]) {
+                if (KimiRunForceAXEnabled()) {
+                    return @"ax";
+                }
+                NSString *defaultMethod = KimiRunDefaultMethod();
+                if (![defaultMethod isKindOfClass:[NSString class]] || defaultMethod.length == 0) {
+                    return @"ax";
+                }
+                NSString *trimmedDefault = [defaultMethod stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                NSString *lowerDefault = [trimmedDefault lowercaseString];
+                if (lowerDefault.length == 0 || [lowerDefault isEqualToString:@"auto"]) {
+                    return @"ax";
+                }
+                return lowerDefault;
             }
             return lowerRequested;
         }
@@ -88,10 +102,17 @@ static NSString *KimiRunResolveMethod(NSString *method) {
         return @"ax";
     }
     if (![value isKindOfClass:[NSString class]] || value.length == 0) {
-        return @"auto";
+        return @"ax";
     }
     NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    return trimmed.length > 0 ? [trimmed lowercaseString] : @"auto";
+    if (trimmed.length == 0) {
+        return @"ax";
+    }
+    NSString *lower = [trimmed lowercaseString];
+    if ([lower isEqualToString:@"auto"]) {
+        return @"ax";
+    }
+    return lower;
 }
 
 static BOOL KimiRunMethodRequiresVerifiedDelivery(NSString *lowerMethod) {

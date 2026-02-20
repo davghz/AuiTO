@@ -175,58 +175,27 @@ void UpdateHIDConnection(void) {
         return;
     }
     @try {
-        // Path 1: BKAccessibility -> eventRoutingClientConnectionManager
+        // Primary path: BKAccessibility -> eventRoutingClientConnectionManager.
+        // This is the only runtime manager path we actively support on iOS 13.
         Class bkAccClass = NSClassFromString(@"BKAccessibility");
         id mgr = nil;
         if (bkAccClass && [bkAccClass respondsToSelector:@selector(_eventRoutingClientConnectionManager)]) {
             mgr = ((id (*)(id, SEL))objc_msgSend)(bkAccClass, @selector(_eventRoutingClientConnectionManager));
         }
         if (mgr && [mgr respondsToSelector:@selector(clientForTaskPort:)]) {
-            g_hidConnection = [mgr clientForTaskPort:mach_task_self()];
+            void *(*clientForTaskPortMsg)(id, SEL, mach_port_t) = (void *(*)(id, SEL, mach_port_t))objc_msgSend;
+            g_hidConnection = clientForTaskPortMsg(mgr, @selector(clientForTaskPort:), mach_task_self());
             NSLog(@"[KimiRunTouchInjection] HID connection from BKAccessibility: %p", g_hidConnection);
         }
 
         if (g_hidConnection) {
             return;
         }
-
-        // Path 2: BKHIDClientConnectionManager singleton
-        Class mgrClass = NSClassFromString(@"BKHIDClientConnectionManager");
-        if (mgrClass) {
-            if (!g_loggedBKHIDSelectors) {
-                g_loggedBKHIDSelectors = YES;
-                LogSelectorsForClass(mgrClass, "BKHIDClientConnectionManager");
-            }
-            id manager = nil;
-            NSString *managerSource = nil;
-            if ([mgrClass respondsToSelector:@selector(sharedInstance)]) {
-                manager = [mgrClass sharedInstance];
-                managerSource = @"sharedInstance";
-            }
-            if (!manager && [mgrClass respondsToSelector:@selector(sharedManager)]) {
-                manager = [mgrClass sharedManager];
-                managerSource = @"sharedManager";
-            }
-            if (!manager && [mgrClass respondsToSelector:@selector(defaultManager)]) {
-                manager = [mgrClass defaultManager];
-                managerSource = @"defaultManager";
-            }
-            if (!manager && [mgrClass respondsToSelector:@selector(manager)]) {
-                manager = [mgrClass manager];
-                managerSource = @"manager";
-            }
-            if (manager && [manager respondsToSelector:@selector(clientForTaskPort:)]) {
-                g_hidConnection = [manager clientForTaskPort:mach_task_self()];
-                if (g_hidConnection) {
-                    NSLog(@"[KimiRunTouchInjection] HID connection from BKHIDClientConnectionManager(%@): %p",
-                          managerSource ?: @"(unknown)", g_hidConnection);
-                }
-            }
-        } else if (!g_loggedBKHIDSelectors) {
+        if (!g_loggedBKHIDSelectors) {
             g_loggedBKHIDSelectors = YES;
-            NSLog(@"[KimiRunTouchInjection] BKHIDClientConnectionManager class not found at runtime");
+            NSLog(@"[KimiRunTouchInjection] BKAccessibility manager did not yield an HID connection");
             NSString *path = @"/var/mobile/Library/Preferences/kimirun_bkhid_selectors.txt";
-            [@"BKHIDClientConnectionManager class not found at runtime\n" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            [@"BKAccessibility manager did not yield an HID connection\n" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
         }
     } @catch (NSException *e) {
         // Best effort only
@@ -238,7 +207,6 @@ void UpdateHIDConnection(void) {
 
 + (void)logBKHIDSelectorsNow {
     NSArray<NSString *> *candidateClasses = @[
-        @"BKHIDClientConnectionManager",
         @"BKSHIDEventDeliveryManager",
         @"BKSHIDEventRouterManager",
         @"BKAccessibility"

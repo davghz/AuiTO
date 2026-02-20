@@ -12,6 +12,13 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>JetsamProperties</key>
+    <dict>
+        <key>JetsamPriority</key>
+        <integer>18</integer>
+        <key>JetsamMemoryLimit</key>
+        <integer>8192</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>/var/log/auito-daemon.log</string>
     <key>StandardErrorPath</key>

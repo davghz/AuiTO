@@ -6,6 +6,33 @@ extern kern_return_t IORegistryEntryGetRegistryEntryID(io_registry_entry_t entry
 
 static void CleanupSenderCallbacks(void);
 
+static BOOL KimiRunIsSpringBoardProcess(void) {
+    static dispatch_once_t onceToken;
+    static BOOL isSpringBoard = NO;
+    dispatch_once(&onceToken, ^{
+        NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+        NSString *processName = [[NSProcessInfo processInfo] processName];
+        isSpringBoard = [bundleID isEqualToString:@"com.apple.springboard"] ||
+                        [processName isEqualToString:@"SpringBoard"];
+    });
+    return isSpringBoard;
+}
+
+static NSInteger KimiRunNoDigitizerCallbackLimit(void) {
+    // In non-SpringBoard processes, stop expensive sender capture if we never
+    // observe a digitizer event and already have a usable sender ID.
+    NSInteger fallback = KimiRunIsSpringBoardProcess() ? 2000 : 500;
+    return KimiRunTouchEnvInteger("KIMIRUN_SENDER_NODIGITIZER_LIMIT",
+                                  KimiRunTouchPrefInteger(@"SenderNoDigitizerLimit", fallback));
+}
+
+static NSInteger KimiRunSenderCallbackLogInterval(void) {
+    NSInteger fallback = KimiRunIsSpringBoardProcess() ? 200 : 500;
+    NSInteger configured = KimiRunTouchEnvInteger("KIMIRUN_SENDER_LOG_INTERVAL",
+                                                  KimiRunTouchPrefInteger(@"SenderLogInterval", fallback));
+    return (configured > 0) ? configured : fallback;
+}
+
 // Extracted from TouchInjection.m: senderID persistence + capture management
 static void PersistSenderID(uint64_t senderID) {
     if (senderID == 0) {
@@ -172,7 +199,24 @@ static void SenderIDCallback(void* target, void* refcon, void* service, IOHIDEve
             CleanupSenderCallbacks();
         }
     }
-    if (g_senderCallbackCount <= 5 || (g_senderCallbackCount % 100) == 0) {
+    if (!senderFromDigitizer && g_senderCallbackDigitizerCount == 0 && g_senderID != 0) {
+        NSInteger limit = KimiRunNoDigitizerCallbackLimit();
+        if (limit > 0 && g_senderCallbackCount >= limit) {
+            g_senderCaptured = YES;
+            if (g_senderSource == 0) {
+                g_senderSource = 3;
+            }
+            NSLog(@"[KimiRunTouchInjection] SenderID callback stopped after %d non-digitizer events; reusing senderID=0x%llX",
+                  g_senderCallbackCount,
+                  g_senderID);
+            KimiRunLog([NSString stringWithFormat:@"[SenderID] stop-nondigitizer callbackCount=%d senderID=0x%llX",
+                        g_senderCallbackCount,
+                        g_senderID]);
+            CleanupSenderCallbacks();
+        }
+    }
+    NSInteger logInterval = KimiRunSenderCallbackLogInterval();
+    if (g_senderCallbackCount <= 5 || (logInterval > 0 && (g_senderCallbackCount % (int)logInterval) == 0)) {
         NSLog(@"[KimiRunTouchInjection] SenderID callback fired (%d), lastType=%d, digitizerCount=%d, senderFromDigitizer=%d",
               g_senderCallbackCount, g_senderLastEventType, g_senderCallbackDigitizerCount, senderFromDigitizer);
     }
@@ -272,21 +316,37 @@ static void SenderIDThreadMain(void) {
         _IOHIDEventSystemClientRegisterEventCallback(g_senderClient, (void *)SenderIDCallback, NULL, NULL);
         NSLog(@"[KimiRunTouchInjection] SenderID thread registered callback on runloop %p", runloop);
 
-        // Periodic logging to confirm thread is alive
-        NSTimer *timer = [NSTimer timerWithTimeInterval:2.0
-                                                 target:[NSBlockOperation blockOperationWithBlock:^{
-            NSLog(@"[KimiRunTouchInjection] SenderID thread alive, callbackCount=%d, senderID=0x%llX",
-                  g_senderCallbackCount, g_senderID);
-        }]
-                                               selector:@selector(main)
-                                               userInfo:nil
-                                                repeats:YES];
-        [[NSRunLoop currentRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+        BOOL heartbeatLoggingEnabled = NO;
+        const char *heartbeatEnv = getenv("KIMIRUN_SENDER_HEARTBEAT");
+        if (heartbeatEnv && heartbeatEnv[0] != '\0') {
+            NSString *lower = [[[NSString stringWithUTF8String:heartbeatEnv]
+                                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+                               lowercaseString];
+            heartbeatLoggingEnabled = ([lower isEqualToString:@"1"] ||
+                                       [lower isEqualToString:@"true"] ||
+                                       [lower isEqualToString:@"yes"] ||
+                                       [lower isEqualToString:@"on"]);
+        }
+        NSTimer *heartbeatTimer = nil;
+        if (heartbeatLoggingEnabled) {
+            heartbeatTimer = [NSTimer timerWithTimeInterval:2.0
+                                                     target:[NSBlockOperation blockOperationWithBlock:^{
+                NSLog(@"[KimiRunTouchInjection] SenderID thread alive, callbackCount=%d, senderID=0x%llX",
+                      g_senderCallbackCount, g_senderID);
+            }]
+                                                   selector:@selector(main)
+                                                   userInfo:nil
+                                                    repeats:YES];
+            [[NSRunLoop currentRunLoop] addTimer:heartbeatTimer forMode:NSDefaultRunLoopMode];
+        }
 
         while (g_senderThreadRunning) {
             @autoreleasepool {
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
             }
+        }
+        if (heartbeatTimer) {
+            [heartbeatTimer invalidate];
         }
     }
 }
