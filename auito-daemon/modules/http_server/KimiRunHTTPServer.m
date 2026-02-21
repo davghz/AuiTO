@@ -41,6 +41,8 @@ static NSString *KimiRunFrontmostBundleID(void);
 static NSDictionary *KimiRunLockState(void);
 static BOOL KimiRunLaunchAppBundleID(NSString *bundleID);
 static NSArray *KimiRunListApplications(BOOL includeSystem);
+static NSDictionary *KimiRunGoHome(void);
+static NSDictionary *KimiRunOpenAppSwitcher(NSString *bundleHint);
 static NSString *const kKimiRunPrefsSuite = @"com.auito.daemon";
 static NSUInteger sLastGoodCapturePort = 0;
 static NSUInteger sLastGoodTouchPort = 0;
@@ -378,6 +380,306 @@ static BOOL KimiRunLaunchAppBundleID(NSString *bundleID) {
     }
 
     return NO;
+}
+
+static NSDictionary *KimiRunGoHome(void) {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"action"] = @"go_home";
+
+    NSArray<NSString *> *classCandidates = @[
+        @"SBUIController",
+        @"SBHomeHardwareButtonActions",
+        @"SpringBoard"
+    ];
+    NSArray<NSString *> *sharedSelectors = @[
+        @"sharedInstance",
+        @"sharedController",
+        @"_sharedInstance"
+    ];
+    NSArray<NSString *> *noArgSelectors = @[
+        @"handleHomeButtonSinglePressUp",
+        @"handleHomeButtonSinglePressDown",
+        @"clickedMenuButton",
+        @"_simulateHomeButtonPress"
+    ];
+    NSArray<NSString *> *singleArgSelectors = @[
+        @"clickedMenuButtonWithSource:"
+    ];
+
+    for (NSString *className in classCandidates) {
+        Class cls = NSClassFromString(className);
+        if (!cls) {
+            continue;
+        }
+
+        id service = nil;
+        NSString *sharedSelectorUsed = nil;
+        for (NSString *sharedName in sharedSelectors) {
+            SEL sharedSel = NSSelectorFromString(sharedName);
+            if (![cls respondsToSelector:sharedSel]) {
+                continue;
+            }
+            @try {
+                service = ((id (*)(id, SEL))objc_msgSend)(cls, sharedSel);
+                if (service) {
+                    sharedSelectorUsed = sharedName;
+                    break;
+                }
+            } @catch (__unused NSException *e) {
+            }
+        }
+        if (!service) {
+            @try {
+                service = [[cls alloc] init];
+                if (service) {
+                    sharedSelectorUsed = @"alloc/init";
+                }
+            } @catch (__unused NSException *e) {
+                service = nil;
+            }
+        }
+        if (!service) {
+            continue;
+        }
+
+        for (NSString *selectorName in noArgSelectors) {
+            SEL sel = NSSelectorFromString(selectorName);
+            if (![service respondsToSelector:sel]) {
+                continue;
+            }
+            @try {
+                NSMethodSignature *sig = [service methodSignatureForSelector:sel];
+                if (!sig || [sig numberOfArguments] != 2) {
+                    continue;
+                }
+                const char *retType = [sig methodReturnType];
+                BOOL shouldReturn = YES;
+                if (retType && strcmp(retType, @encode(void)) == 0) {
+                    ((void (*)(id, SEL))objc_msgSend)(service, sel);
+                } else if (retType && (strcmp(retType, @encode(BOOL)) == 0 || strcmp(retType, "B") == 0 || strcmp(retType, "c") == 0)) {
+                    BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(service, sel);
+                    result[@"callReturned"] = @(ok);
+                    shouldReturn = ok;
+                } else {
+                    id response = ((id (*)(id, SEL))objc_msgSend)(service, sel);
+                    if (response) {
+                        result[@"callValue"] = [response description] ?: @"";
+                    }
+                }
+                if (shouldReturn) {
+                    result[@"activated"] = @YES;
+                    result[@"class"] = className;
+                    result[@"sharedSelector"] = sharedSelectorUsed ?: @"";
+                    result[@"selector"] = selectorName;
+                    result[@"mode"] = @"home";
+                    return result;
+                }
+            } @catch (__unused NSException *e) {
+            }
+        }
+
+        for (NSString *selectorName in singleArgSelectors) {
+            SEL sel = NSSelectorFromString(selectorName);
+            if (![service respondsToSelector:sel]) {
+                continue;
+            }
+            @try {
+                NSMethodSignature *sig = [service methodSignatureForSelector:sel];
+                if (!sig || [sig numberOfArguments] != 3) {
+                    continue;
+                }
+                const char *retType = [sig methodReturnType];
+                BOOL shouldReturn = YES;
+                if (retType && strcmp(retType, @encode(void)) == 0) {
+                    ((void (*)(id, SEL, NSInteger))objc_msgSend)(service, sel, 0);
+                } else if (retType && (strcmp(retType, @encode(BOOL)) == 0 || strcmp(retType, "B") == 0 || strcmp(retType, "c") == 0)) {
+                    BOOL ok = ((BOOL (*)(id, SEL, NSInteger))objc_msgSend)(service, sel, 0);
+                    result[@"callReturned"] = @(ok);
+                    shouldReturn = ok;
+                } else {
+                    id response = ((id (*)(id, SEL, NSInteger))objc_msgSend)(service, sel, 0);
+                    if (response) {
+                        result[@"callValue"] = [response description] ?: @"";
+                    }
+                }
+                if (shouldReturn) {
+                    result[@"activated"] = @YES;
+                    result[@"class"] = className;
+                    result[@"sharedSelector"] = sharedSelectorUsed ?: @"";
+                    result[@"selector"] = selectorName;
+                    result[@"mode"] = @"home";
+                    return result;
+                }
+            } @catch (__unused NSException *e) {
+            }
+        }
+    }
+
+    id app = [UIApplication sharedApplication];
+    if (app) {
+        SEL simulateSel = NSSelectorFromString(@"_simulateHomeButtonPress");
+        if ([app respondsToSelector:simulateSel]) {
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(app, simulateSel);
+                result[@"activated"] = @YES;
+                result[@"class"] = @"SpringBoard";
+                result[@"sharedSelector"] = @"sharedApplication";
+                result[@"selector"] = @"_simulateHomeButtonPress";
+                result[@"mode"] = @"home";
+                return result;
+            } @catch (__unused NSException *e) {
+            }
+        }
+    }
+
+    result[@"activated"] = @NO;
+    result[@"reason"] = @"no_home_selector_available";
+    result[@"mode"] = @"home";
+    return result;
+}
+
+static NSDictionary *KimiRunOpenAppSwitcher(NSString *bundleHint) {
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    result[@"action"] = @"open_app_switcher";
+    if ([bundleHint isKindOfClass:[NSString class]] && bundleHint.length > 0) {
+        result[@"bundleHint"] = bundleHint;
+    }
+
+    NSArray<NSString *> *classCandidates = @[
+        @"SBSAppSwitcherSystemService",
+        @"SBAppSwitcherSystemService",
+        @"SBUIController",
+        @"AXSSActionManager",
+        @"AXPISystemActionHelper"
+    ];
+    NSArray<NSString *> *sharedSelectors = @[
+        @"sharedInstance",
+        @"sharedService",
+        @"_sharedInstance",
+        @"sharedManager"
+    ];
+    NSArray<NSString *> *plainSelectors = @[
+        @"handleHomeButtonDoublePressDown",
+        @"_toggleAppSwitcher",
+        @"openAppSwitcher",
+        @"activateAppSwitcher",
+        @"toggleAppSwitcher",
+        @"_openAppSwitcher",
+        @"requestAppSwitcherAppearance",
+        @"requestAppSwitcherAppearanceForHiddenApp"
+    ];
+    NSArray<NSString *> *bundleSelectors = @[
+        @"requestAppSwitcherAppearanceForHiddenApplicationWithBundleIdentifier:",
+        @"requestAppSwitcherAppearanceForHiddenAppWithBundleIdentifier:"
+    ];
+
+    for (NSString *className in classCandidates) {
+        Class cls = NSClassFromString(className);
+        if (!cls) {
+            continue;
+        }
+
+        id service = nil;
+        NSString *sharedSelectorUsed = nil;
+        for (NSString *sharedName in sharedSelectors) {
+            SEL sharedSel = NSSelectorFromString(sharedName);
+            if (![cls respondsToSelector:sharedSel]) {
+                continue;
+            }
+            @try {
+                service = ((id (*)(id, SEL))objc_msgSend)(cls, sharedSel);
+                if (service) {
+                    sharedSelectorUsed = sharedName;
+                    break;
+                }
+            } @catch (__unused NSException *e) {
+            }
+        }
+        if (!service) {
+            @try {
+                service = [[cls alloc] init];
+                if (service) {
+                    sharedSelectorUsed = @"alloc/init";
+                }
+            } @catch (__unused NSException *e) {
+                service = nil;
+            }
+        }
+        if (!service) {
+            continue;
+        }
+
+        for (NSString *selectorName in plainSelectors) {
+            SEL sel = NSSelectorFromString(selectorName);
+            if (![service respondsToSelector:sel]) {
+                continue;
+            }
+            @try {
+                NSMethodSignature *sig = [service methodSignatureForSelector:sel];
+                if (!sig) {
+                    continue;
+                }
+                const char *retType = [sig methodReturnType];
+                if (retType && strcmp(retType, @encode(void)) == 0) {
+                    ((void (*)(id, SEL))objc_msgSend)(service, sel);
+                } else if (retType && (strcmp(retType, @encode(BOOL)) == 0 || strcmp(retType, "B") == 0 || strcmp(retType, "c") == 0)) {
+                    BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(service, sel);
+                    result[@"callReturned"] = @(ok);
+                } else {
+                    id response = ((id (*)(id, SEL))objc_msgSend)(service, sel);
+                    if (response) {
+                        result[@"callValue"] = [response description] ?: @"";
+                    }
+                }
+                result[@"activated"] = @YES;
+                result[@"class"] = className;
+                result[@"sharedSelector"] = sharedSelectorUsed ?: @"";
+                result[@"selector"] = selectorName;
+                return result;
+            } @catch (__unused NSException *e) {
+            }
+        }
+
+        if ([bundleHint isKindOfClass:[NSString class]] && bundleHint.length > 0) {
+            for (NSString *selectorName in bundleSelectors) {
+                SEL sel = NSSelectorFromString(selectorName);
+                if (![service respondsToSelector:sel]) {
+                    continue;
+                }
+                @try {
+                    ((void (*)(id, SEL, id))objc_msgSend)(service, sel, bundleHint);
+                    result[@"activated"] = @YES;
+                    result[@"class"] = className;
+                    result[@"sharedSelector"] = sharedSelectorUsed ?: @"";
+                    result[@"selector"] = selectorName;
+                    return result;
+                } @catch (__unused NSException *e) {
+                }
+            }
+        }
+    }
+
+    // Final fallback if no app-switcher selector could be activated.
+    id app = [UIApplication sharedApplication];
+    if (app) {
+        SEL simulateSel = NSSelectorFromString(@"_simulateHomeButtonPress");
+        if ([app respondsToSelector:simulateSel]) {
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(app, simulateSel);
+                result[@"activated"] = @YES;
+                result[@"class"] = @"SpringBoard";
+                result[@"sharedSelector"] = @"sharedApplication";
+                result[@"selector"] = @"_simulateHomeButtonPress";
+                result[@"mode"] = @"home_button_simulation_fallback";
+                return result;
+            } @catch (__unused NSException *e) {
+            }
+        }
+    }
+
+    result[@"activated"] = @NO;
+    result[@"reason"] = @"no_app_switcher_selector_available";
+    return result;
 }
 
 static NSArray *KimiRunListApplications(BOOL includeSystem) {
@@ -1037,6 +1339,70 @@ static NSArray *KimiRunListApplications(BOOL includeSystem) {
                 return [self jsonResponse:200 body:json];
             }
             return [self jsonResponse:200 body:@"{\"status\":\"ok\"}"];
+        }
+        return [self errorResponse:405 message:@"Method Not Allowed"];
+    } else if ([path isEqualToString:@"/app/switcher"]) {
+        if ([method isEqualToString:@"GET"] || [method isEqualToString:@"POST"]) {
+            NSString *bundleID = nil;
+            if ([fullPath containsString:@"?"]) {
+                NSRange queryRange = [fullPath rangeOfString:@"?"];
+                NSString *queryString = [fullPath substringFromIndex:queryRange.location + 1];
+                bundleID = [self stringValueFromQuery:queryString key:@"bundleID"];
+                if (!bundleID || bundleID.length == 0) {
+                    bundleID = [self stringValueFromQuery:queryString key:@"bundleIdentifier"];
+                }
+            }
+            if (!bundleID || bundleID.length == 0) {
+                bundleID = KimiRunFrontmostBundleID();
+            }
+            __block NSDictionary *info = nil;
+            if ([NSThread isMainThread]) {
+                info = KimiRunOpenAppSwitcher(bundleID);
+            } else {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    info = KimiRunOpenAppSwitcher(bundleID);
+                });
+            }
+            NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+            BOOL activated = [info[@"activated"] respondsToSelector:@selector(boolValue)] && [info[@"activated"] boolValue];
+            payload[@"status"] = activated ? @"ok" : @"error";
+            payload[@"mode"] = @"app_switcher";
+            if ([info isKindOfClass:[NSDictionary class]]) {
+                [payload addEntriesFromDictionary:info];
+            }
+            NSError *jsonError = nil;
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonError];
+            if (jsonData.length > 0 && !jsonError) {
+                NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+                return [self jsonResponse:(activated ? 200 : 500) body:json];
+            }
+            return [self jsonResponse:(activated ? 200 : 500) body:(activated ? @"{\"status\":\"ok\",\"mode\":\"app_switcher\"}" : @"{\"status\":\"error\",\"mode\":\"app_switcher\"}")];
+        }
+        return [self errorResponse:405 message:@"Method Not Allowed"];
+    } else if ([path isEqualToString:@"/home"]) {
+        if ([method isEqualToString:@"GET"] || [method isEqualToString:@"POST"]) {
+            __block NSDictionary *info = nil;
+            if ([NSThread isMainThread]) {
+                info = KimiRunGoHome();
+            } else {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    info = KimiRunGoHome();
+                });
+            }
+            NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+            BOOL activated = [info[@"activated"] respondsToSelector:@selector(boolValue)] && [info[@"activated"] boolValue];
+            payload[@"status"] = activated ? @"ok" : @"error";
+            payload[@"mode"] = @"home";
+            if ([info isKindOfClass:[NSDictionary class]]) {
+                [payload addEntriesFromDictionary:info];
+            }
+            NSError *jsonError = nil;
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:payload options:0 error:&jsonError];
+            if (jsonData.length > 0 && !jsonError) {
+                NSString *json = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+                return [self jsonResponse:(activated ? 200 : 500) body:json];
+            }
+            return [self jsonResponse:(activated ? 200 : 500) body:(activated ? @"{\"status\":\"ok\",\"mode\":\"home\"}" : @"{\"status\":\"error\",\"mode\":\"home\"}")];
         }
         return [self errorResponse:405 message:@"Method Not Allowed"];
     } else if ([path isEqualToString:@"/app/launch"]) {

@@ -113,9 +113,15 @@
 
 + (instancetype)sharedInstance;
 
-- (void)enableAppSwitcher;
-- (void)disableAppSwitcher;
-- (BOOL)isAppSwitcherEnabled;
+// Observed on-device in SpringBoard/SpringBoardServices symbols (iOS 13+).
+// Selectors are invoked dynamically to keep compatibility across builds.
+- (void)openAppSwitcher;
+- (void)dismissAppSwitcher;
+- (void)activateAppSwitcher;
+- (void)toggleAppSwitcher;
+- (void)requestAppSwitcherAppearance;
+- (void)requestAppSwitcherAppearanceForHiddenApp;
+- (void)requestAppSwitcherAppearanceForHiddenApplicationWithBundleIdentifier:(NSString *)bundleIdentifier;
 
 @end
 

@@ -7,7 +7,7 @@ Combines device control tools.
 from typing import List
 from mcp.types import Tool
 
-from .device_tools import DeviceToolRegistry, get_device_registry
+from .device import DeviceToolRegistry, get_device_registry
 
 
 class UnifiedToolRegistry:

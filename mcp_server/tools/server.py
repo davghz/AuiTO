@@ -9,7 +9,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
 from .unified_tools import get_unified_registry
-from .device_tools import KIMIRUN_HOST, KIMIRUN_PORT, BASE_URL
+from .device import KIMIRUN_HOST, KIMIRUN_PORT, BASE_URL
 
 
 def create_mcp_server() -> Server:

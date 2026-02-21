@@ -2020,6 +2020,32 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
         return [self jsonResponse:200 body:json];
     }
 
+    if ([routePath isEqualToString:@"/home"] || [routePath isEqualToString:@"/app/switcher"]) {
+        // Route Home/App Switcher requests to SpringBoard-side server where
+        // private SB/SBS classes are available.
+        BOOL appSwitcherRoute = [routePath isEqualToString:@"/app/switcher"];
+        NSString *proxyBody = [self proxySpringBoardResponseForPath:path timeout:0.9];
+        if (proxyBody.length > 0) {
+            NSInteger statusCode = 200;
+            NSDictionary *proxyJSON = [self parseJSONBody:proxyBody];
+            if ([proxyJSON isKindOfClass:[NSDictionary class]]) {
+                id statusValue = proxyJSON[@"status"];
+                if ([statusValue isKindOfClass:[NSString class]] &&
+                    [[(NSString *)statusValue lowercaseString] isEqualToString:@"error"]) {
+                    statusCode = 500;
+                } else if ([proxyJSON[@"success"] respondsToSelector:@selector(boolValue)] &&
+                           ![proxyJSON[@"success"] boolValue]) {
+                    statusCode = 500;
+                }
+            }
+            return [self jsonResponse:statusCode body:proxyBody];
+        }
+        NSString *json = appSwitcherRoute
+            ? @"{\"status\":\"error\",\"mode\":\"app_switcher\",\"message\":\"SpringBoard /app/switcher endpoint unavailable\"}"
+            : @"{\"status\":\"error\",\"mode\":\"home\",\"message\":\"SpringBoard /home endpoint unavailable\"}";
+        return [self jsonResponse:503 body:json];
+    }
+
     if ([routePath isEqualToString:@"/logs"]) {
         NSInteger tail = (NSInteger)[self floatValueFromQuery:path key:@"tail"];
         if (tail <= 0) tail = 200;

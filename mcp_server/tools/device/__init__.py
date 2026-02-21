@@ -1,14 +1,9 @@
-"""Compatibility facade for modular device tools.
+"""Modular device tools package."""
 
-This module preserves the historical import path (`tools.device_tools`) while
-implementation now lives under `tools.device`.
-"""
-
-from .device import (
+from .client import (
     BASE_URL,
     KIMIRUN_HOST,
     KIMIRUN_PORT,
-    DeviceToolRegistry,
     KimiRunDeviceClient,
     _http_ping_ok,
     _is_local_host,
@@ -16,8 +11,8 @@ from .device import (
     _parse_ports,
     _pick_free_port,
     _start_local_daemon_if_needed,
-    get_device_registry,
 )
+from .registry import DeviceToolRegistry, get_device_registry
 
 __all__ = [
     "BASE_URL",
@@ -26,10 +21,10 @@ __all__ = [
     "KimiRunDeviceClient",
     "DeviceToolRegistry",
     "get_device_registry",
-    "_is_truthy",
-    "_pick_free_port",
-    "_parse_ports",
-    "_is_local_host",
     "_http_ping_ok",
+    "_is_local_host",
+    "_is_truthy",
+    "_parse_ports",
+    "_pick_free_port",
     "_start_local_daemon_if_needed",
 ]

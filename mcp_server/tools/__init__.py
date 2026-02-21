@@ -48,7 +48,7 @@ __version__ = "1.0.0"
 AI_TOOLS_AVAILABLE = False
 
 # Device control
-from .device_tools import (
+from .device import (
     KimiRunDeviceClient,
     DeviceToolRegistry,
     get_device_registry,
