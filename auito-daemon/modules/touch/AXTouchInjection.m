@@ -213,56 +213,48 @@ static BOOL AXScrollViewSwipe(CGPoint startPoint, CGPoint endPoint, NSTimeInterv
         // Load AccessibilityUtilities + try enabling AX services
         LoadAXUtilities();
         [self ensureAccessibilityEnabled];
-
-        // Prefer direct accessibility activation at point when available.
-        if ([AccessibilityTree activateElementAtPoint:point]) {
-            NSLog(@"[AXTouchInjection] Tap activated element at (%.1f, %.1f)", point.x, point.y);
-            return YES;
-        }
         
         // Get AXEventRepresentation class
         Class AXEventRepClass = NSClassFromString(@"AXEventRepresentation");
         if (!AXEventRepClass) {
-            NSLog(@"[AXTouchInjection] AXEventRepresentation not found");
-            return NO;
+            NSLog(@"[AXTouchInjection] AXEventRepresentation not found; trying activation fallback");
+        } else {
+            // Create touch event (handType 2 = finger) using typed objc_msgSend.
+            SEL createSel = NSSelectorFromString(@"touchRepresentationWithHandType:location:");
+            if (![AXEventRepClass respondsToSelector:createSel]) {
+                NSLog(@"[AXTouchInjection] Missing selector %@", NSStringFromSelector(createSel));
+            } else {
+                id (*CreateEventRepresentation)(id, SEL, int, CGPoint) = (id (*)(id, SEL, int, CGPoint))objc_msgSend;
+                id event = CreateEventRepresentation(AXEventRepClass, createSel, 2, point);
+                if (!event) {
+                    NSLog(@"[AXTouchInjection] Failed to create event");
+                } else {
+                    // Get AXBackBoardServer
+                    Class AXServerClass = NSClassFromString(@"AXBackBoardServer");
+                    if (!AXServerClass) {
+                        NSLog(@"[AXTouchInjection] AXBackBoardServer not found");
+                    } else {
+                        id server = [AXServerClass performSelector:@selector(server)];
+                        if (!server) {
+                            NSLog(@"[AXTouchInjection] Failed to get server");
+                        } else {
+                            SEL postSel = NSSelectorFromString(@"postEvent:systemEvent:");
+                            if (![server respondsToSelector:postSel]) {
+                                NSLog(@"[AXTouchInjection] Missing selector %@", NSStringFromSelector(postSel));
+                            } else {
+                                void (*PostEvent)(id, SEL, id, BOOL) = (void (*)(id, SEL, id, BOOL))objc_msgSend;
+                                PostEvent(server, postSel, event, YES);
+                                NSLog(@"[AXTouchInjection] Tap posted at (%.1f, %.1f)", point.x, point.y);
+                                return YES;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Create touch event (handType 2 = finger) using typed objc_msgSend.
-        SEL createSel = NSSelectorFromString(@"touchRepresentationWithHandType:location:");
-        if (![AXEventRepClass respondsToSelector:createSel]) {
-            NSLog(@"[AXTouchInjection] Missing selector %@", NSStringFromSelector(createSel));
-            return NO;
-        }
-        id (*CreateEventRepresentation)(id, SEL, int, CGPoint) = (id (*)(id, SEL, int, CGPoint))objc_msgSend;
-        id event = CreateEventRepresentation(AXEventRepClass, createSel, 2, point);
-        if (!event) {
-            NSLog(@"[AXTouchInjection] Failed to create event");
-            return NO;
-        }
-        
-        // Get AXBackBoardServer
-        Class AXServerClass = NSClassFromString(@"AXBackBoardServer");
-        if (!AXServerClass) {
-            NSLog(@"[AXTouchInjection] AXBackBoardServer not found");
-            return NO;
-        }
-        
-        id server = [AXServerClass performSelector:@selector(server)];
-        if (!server) {
-            NSLog(@"[AXTouchInjection] Failed to get server");
-            return NO;
-        }
-
-        SEL postSel = NSSelectorFromString(@"postEvent:systemEvent:");
-        if (![server respondsToSelector:postSel]) {
-            NSLog(@"[AXTouchInjection] Missing selector %@", NSStringFromSelector(postSel));
-            return NO;
-        }
-        void (*PostEvent)(id, SEL, id, BOOL) = (void (*)(id, SEL, id, BOOL))objc_msgSend;
-        PostEvent(server, postSel, event, YES);
-        
-        NSLog(@"[AXTouchInjection] Tap posted at (%.1f, %.1f)", point.x, point.y);
-        return YES;
+        // Deprecated: activation fallback scan removed because it can stall.
+        return NO;
         
     } @catch (NSException *e) {
         NSLog(@"[AXTouchInjection] Exception: %@", e);

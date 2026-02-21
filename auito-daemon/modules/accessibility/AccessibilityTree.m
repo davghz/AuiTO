@@ -16,6 +16,7 @@ static NSArray *cachedInteractive = nil;
 static NSTimeInterval cachedInteractiveAt = 0;
 static const NSTimeInterval kTreeCacheTTL = 0.25;
 static const NSTimeInterval kInteractiveCacheTTL = 0.5;
+static const NSTimeInterval kAXFallbackTimeoutSeconds = 0.40;
 static const NSUInteger kAXMaxElements = 500;
 static const NSUInteger kOverlayMaxElements = 200;
 static UIWindow *overlayWindow = nil;
@@ -498,6 +499,7 @@ static BOOL IOSRunAXElementIsInteractive(id element) {
 static void IOSRunAXCollectFromElement(id element,
                                        NSMutableSet<NSValue *> *visited,
                                        NSMutableArray<NSDictionary *> *out,
+                                       NSMutableArray *outRefs,
                                        NSUInteger *count) {
     if (!element || !visited || !out || !count) return;
     if (*count >= kAXMaxElements) return;
@@ -506,21 +508,30 @@ static void IOSRunAXCollectFromElement(id element,
     if ([visited containsObject:key]) return;
     [visited addObject:key];
 
+    NSDictionary *dict = nil;
     if (IOSRunAXElementIsInteractive(element)) {
-        NSDictionary *dict = IOSRunDictForAXElement(element);
-        if (dict) {
-            NSMutableDictionary *mutable = [dict mutableCopy];
-            mutable[@"index"] = @(*count);
-            [out addObject:mutable];
-            (*count)++;
-            if (*count >= kAXMaxElements) return;
-        }
+        dict = IOSRunDictForAXElement(element);
+    } else if (IOSRunIsInteractiveGenericElement(element)) {
+        dict = IOSRunDictForGenericElement(element);
     }
+
+    if (!dict || IOSRunElementDictLooksOverlayOnly(dict)) {
+        return;
+    }
+
+    NSMutableDictionary *mutable = [dict mutableCopy];
+    mutable[@"index"] = @(*count);
+    [out addObject:mutable];
+    if (outRefs) {
+        [outRefs addObject:element ?: [NSNull null]];
+    }
+    (*count)++;
+    if (*count >= kAXMaxElements) return;
 
     if ([element respondsToSelector:@selector(children)]) {
         NSArray *children = [element performSelector:@selector(children)];
         for (id child in children ?: @[]) {
-            IOSRunAXCollectFromElement(child, visited, out, count);
+            IOSRunAXCollectFromElement(child, visited, out, outRefs, count);
             if (*count >= kAXMaxElements) return;
         }
     }
@@ -625,8 +636,10 @@ static void IOSRunAXCollectFromElement(id element,
         return;
     }
 
-    NSArray *elements = [self getInteractiveElements];
-    [self refreshOverlayWithElements:elements];
+    // Never block request handling on collection. Overlay refresh can be driven
+    // by subsequent /a11y/interactive calls.
+    NSArray *snapshot = cachedInteractive ?: @[];
+    [self refreshOverlayWithElements:snapshot];
 }
 
 + (BOOL)isOverlayEnabled {
@@ -987,7 +1000,10 @@ static void IOSRunAXCollectFromElement(id element,
 
     for (UIWindow *window in IOSRunActiveWindows()) {
         if (!window.hidden) {
-            [self collectInteractiveFromView:window into:elements indexCounter:indexCounter elementRefs:elementRefs];
+            [self collectInteractiveFromView:window
+                                        into:elements
+                               indexCounter:indexCounter
+                                elementRefs:elementRefs];
         }
     }
 
@@ -998,132 +1014,108 @@ static void IOSRunAXCollectFromElement(id element,
         return elements;
     }
 
-    // Keep AX fallback enabled when view traversal only sees SpringBoard overlays.
+    // UIKit traversal can miss cross-process content. Run AX source discovery off
+    // the main thread with a hard timeout to avoid SpringBoard watchdog pressure.
     [elements removeAllObjects];
     [elementRefs removeAllObjects];
     [indexCounter removeAllObjects];
 
-    // Fallback: AXRuntime cross-app elements
     Class AXElementClass = NSClassFromString(@"AXElement");
     if (!AXElementClass) {
-        return elements;
-    }
-
-    @try {
-        id app = nil;
-        if ([AXElementClass respondsToSelector:@selector(primaryApp)]) {
-            app = [AXElementClass performSelector:@selector(primaryApp)];
-        }
-        // Try to resolve the frontmost app using AXUIElement if primaryApp is nil
-        if (!app) {
-            CGPoint center = IOSRunPreferredProbePoint();
-            id uiApp = IOSRunAXUIElementAtPoint(center);
-            if (uiApp && [AXElementClass respondsToSelector:@selector(elementWithUIElement:)]) {
-                app = [AXElementClass performSelector:@selector(elementWithUIElement:) withObject:uiApp];
-            }
-        }
-        id system = nil;
-        if ([AXElementClass respondsToSelector:@selector(systemWideElement)]) {
-            system = [AXElementClass performSelector:@selector(systemWideElement)];
-        }
-
-        NSMutableArray *sources = [NSMutableArray array];
-        if (app) [sources addObject:app];
-        if (system && system != app) [sources addObject:system];
-
-        NSMutableSet<NSValue *> *visited = [NSMutableSet set];
-        NSUInteger count = 0;
-
-        for (id source in sources) {
-            if ([source respondsToSelector:@selector(nativeFocusableElements)]) {
-                NSArray *axElems = [source performSelector:@selector(nativeFocusableElements)];
-                for (id ax in axElems ?: @[]) {
-                    IOSRunAXCollectFromElement(ax, visited, elements, &count);
-                    [elementRefs addObject:ax ?: [NSNull null]];
-                    if (count >= kAXMaxElements) break;
-                }
-            }
-
-            if (count >= kAXMaxElements) break;
-
-            if ([source respondsToSelector:@selector(explorerElements)]) {
-                NSArray *axElems = [source performSelector:@selector(explorerElements)];
-                for (id ax in axElems ?: @[]) {
-                    IOSRunAXCollectFromElement(ax, visited, elements, &count);
-                    [elementRefs addObject:ax ?: [NSNull null]];
-                    if (count >= kAXMaxElements) break;
-                }
-            }
-
-            if (count >= kAXMaxElements) break;
-
-            if ([source respondsToSelector:@selector(elementsWithSemanticContext)]) {
-                NSArray *axElems = [source performSelector:@selector(elementsWithSemanticContext)];
-                for (id ax in axElems ?: @[]) {
-                    IOSRunAXCollectFromElement(ax, visited, elements, &count);
-                    [elementRefs addObject:ax ?: [NSNull null]];
-                    if (count >= kAXMaxElements) break;
-                }
-            }
-
-            if (count >= kAXMaxElements) break;
-
-            if ([source respondsToSelector:@selector(firstElementInApplication)]) {
-                id root = [source performSelector:@selector(firstElementInApplication)];
-                IOSRunAXCollectFromElement(root, visited, elements, &count);
-                [elementRefs addObject:root ?: [NSNull null]];
-            }
-        }
-    } @catch (__unused NSException *e) {
-    }
-
-    if (elements.count > 0) {
         @synchronized(self) {
             lastInteractiveElements = elementRefs;
         }
         return elements;
     }
 
-    // Last-resort fallback: sample grid with AXUIElement at coordinates
-    @try {
-        UIWindow *window = IOSRunPreferredWindow();
-        CGRect bounds = window ? [window convertRect:window.bounds toWindow:nil] : [UIScreen mainScreen].bounds;
-        if (CGRectIsEmpty(bounds)) {
-            bounds = [UIScreen mainScreen].bounds;
-        }
-        NSInteger cols = 6;
-        NSInteger rows = 10;
-        CGFloat dx = bounds.size.width / cols;
-        CGFloat dy = bounds.size.height / rows;
-        NSMutableSet<NSValue *> *seen = [NSMutableSet set];
-        NSUInteger count = 0;
-        for (NSInteger r = 0; r < rows; r++) {
-            for (NSInteger c = 0; c < cols; c++) {
-                CGPoint p = CGPointMake((c + 0.5) * dx, (r + 0.5) * dy);
-                id axElem = IOSRunAXElementFromPoint(p);
-                if (!axElem) continue;
-                NSValue *key = [NSValue valueWithPointer:(__bridge const void *)(axElem)];
-                if ([seen containsObject:key]) continue;
-                [seen addObject:key];
-                if (!IOSRunAXElementIsInteractive(axElem)) continue;
-                NSDictionary *dict = IOSRunDictForAXElement(axElem);
-                if (!dict) continue;
-                NSMutableDictionary *mutable = [dict mutableCopy];
-                mutable[@"index"] = @(count);
-                [elements addObject:mutable];
-                [elementRefs addObject:axElem ?: [NSNull null]];
-                count++;
+    CGPoint probePoint = IOSRunPreferredProbePoint();
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    __block NSArray *axElements = nil;
+    __block NSArray *axRefs = nil;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableArray *localElements = [NSMutableArray array];
+        NSMutableArray *localRefs = [NSMutableArray array];
+
+        @try {
+            id app = nil;
+            if ([AXElementClass respondsToSelector:@selector(primaryApp)]) {
+                app = [AXElementClass performSelector:@selector(primaryApp)];
+            }
+            if (!app) {
+                id uiApp = IOSRunAXUIElementAtPoint(probePoint);
+                if (uiApp && [AXElementClass respondsToSelector:@selector(elementWithUIElement:)]) {
+                    app = [AXElementClass performSelector:@selector(elementWithUIElement:) withObject:uiApp];
+                }
+            }
+
+            id system = nil;
+            if ([AXElementClass respondsToSelector:@selector(systemWideElement)]) {
+                system = [AXElementClass performSelector:@selector(systemWideElement)];
+            }
+
+            NSMutableArray *sources = [NSMutableArray array];
+            if (app) [sources addObject:app];
+            if (system && system != app) [sources addObject:system];
+
+            NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+            NSUInteger count = 0;
+            for (id source in sources) {
+                if ([source respondsToSelector:@selector(nativeFocusableElements)]) {
+                    NSArray *axElems = [source performSelector:@selector(nativeFocusableElements)];
+                    for (id ax in axElems ?: @[]) {
+                        IOSRunAXCollectFromElement(ax, visited, localElements, localRefs, &count);
+                        if (count >= kAXMaxElements) break;
+                    }
+                }
+                if (count >= kAXMaxElements) break;
+
+                if ([source respondsToSelector:@selector(explorerElements)]) {
+                    NSArray *axElems = [source performSelector:@selector(explorerElements)];
+                    for (id ax in axElems ?: @[]) {
+                        IOSRunAXCollectFromElement(ax, visited, localElements, localRefs, &count);
+                        if (count >= kAXMaxElements) break;
+                    }
+                }
+                if (count >= kAXMaxElements) break;
+
+                if ([source respondsToSelector:@selector(elementsWithSemanticContext)]) {
+                    NSArray *axElems = [source performSelector:@selector(elementsWithSemanticContext)];
+                    for (id ax in axElems ?: @[]) {
+                        IOSRunAXCollectFromElement(ax, visited, localElements, localRefs, &count);
+                        if (count >= kAXMaxElements) break;
+                    }
+                }
+                if (count >= kAXMaxElements) break;
+
+                if ([source respondsToSelector:@selector(firstElementInApplication)]) {
+                    id root = [source performSelector:@selector(firstElementInApplication)];
+                    IOSRunAXCollectFromElement(root, visited, localElements, localRefs, &count);
+                }
                 if (count >= kAXMaxElements) break;
             }
-            if (count >= kAXMaxElements) break;
+        } @catch (__unused NSException *e) {
         }
-    } @catch (__unused NSException *e) {
+
+        axElements = [localElements copy];
+        axRefs = [localRefs copy];
+        dispatch_semaphore_signal(sema);
+    });
+
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAXFallbackTimeoutSeconds * NSEC_PER_SEC));
+    if (dispatch_semaphore_wait(sema, timeout) == 0) {
+        if (axElements.count > 0) {
+            [elements addObjectsFromArray:axElements];
+        }
+        if (axRefs.count > 0) {
+            [elementRefs addObjectsFromArray:axRefs];
+        }
+    } else {
+        NSLog(@"[KimiRunA11y] AX fallback timed out after %.2fs", kAXFallbackTimeoutSeconds);
     }
 
-    if (elements.count > 0) {
-        @synchronized(self) {
-            lastInteractiveElements = elementRefs;
-        }
+    @synchronized(self) {
+        lastInteractiveElements = elementRefs;
     }
     return elements;
 }

@@ -71,10 +71,21 @@ static BOOL KimiRunShouldStartSocketServer(void) {
 }
 
 static BOOL KimiRunShouldStartAppProcessHTTPServer(void) {
+    if (KimiRunEnvBool("KIMIRUN_DISABLE_APP_HTTP", NO)) {
+        return NO;
+    }
+    if (KimiRunPrefBool(@"DisableAppProcessHTTP", NO)) {
+        return NO;
+    }
     if (KimiRunEnvBool("KIMIRUN_ENABLE_APP_HTTP", NO)) {
         return YES;
     }
-    return KimiRunPrefBool(@"EnableAppProcessHTTP", NO);
+    if (KimiRunPrefBool(@"EnableAppProcessHTTP", NO)) {
+        return YES;
+    }
+    // Keep app-process servers on by default so daemon a11y calls can resolve
+    // foreground app context via :8766/:8767 without SpringBoard cross-process AX.
+    return YES;
 }
 
 static BOOL KimiRunShouldInitializeSpringBoardTouch(void) {

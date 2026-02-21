@@ -78,6 +78,40 @@ static BOOL KimiRunDaemonLocalScreenshotEnabled(void) {
     return [self proxyTouchResponseForPath:path timeout:timeout resolvedPortOut:NULL];
 }
 
+- (NSString *)proxyAppResponseForPath:(NSString *)path
+                               timeout:(NSTimeInterval)timeout
+                       resolvedPortOut:(NSUInteger *)resolvedPortOut {
+    if (!path || path.length == 0) {
+        return nil;
+    }
+    if (resolvedPortOut) {
+        *resolvedPortOut = 0;
+    }
+
+    NSString *normalized = [path hasPrefix:@"/"] ? path : [@"/" stringByAppendingString:path];
+    const NSUInteger ports[] = {kPreferencesProxyPort, kMobileSafariProxyPort};
+    const NSUInteger count = sizeof(ports) / sizeof(ports[0]);
+
+    for (NSUInteger i = 0; i < count; i++) {
+        NSString *urlString = [NSString stringWithFormat:@"http://127.0.0.1:%lu%@",
+                               (unsigned long)ports[i],
+                               normalized];
+        NSData *data = [self fetchURL:[NSURL URLWithString:urlString] timeout:timeout];
+        if (!data || data.length == 0) {
+            continue;
+        }
+        NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (body.length > 0) {
+            if (resolvedPortOut) {
+                *resolvedPortOut = ports[i];
+            }
+            return body;
+        }
+    }
+
+    return nil;
+}
+
 - (NSString *)proxyTouchResponseForPath:(NSString *)path
                                 timeout:(NSTimeInterval)timeout
                         resolvedPortOut:(NSUInteger *)resolvedPortOut {

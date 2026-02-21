@@ -33,6 +33,9 @@ static const NSUInteger kMobileSafariProxyPort = 8767;
 - (NSString *)proxyTouchResponseForPath:(NSString *)path
                                 timeout:(NSTimeInterval)timeout
                         resolvedPortOut:(NSUInteger *)resolvedPortOut;
+- (NSString *)proxyAppResponseForPath:(NSString *)path
+                               timeout:(NSTimeInterval)timeout
+                       resolvedPortOut:(NSUInteger *)resolvedPortOut;
 - (id)proxyTouchHTTPResponseForPath:(NSString *)path timeout:(NSTimeInterval)timeout;
 - (id)strictProxyResponseForPath:(NSString *)path
                           timeout:(NSTimeInterval)timeout
@@ -2035,7 +2038,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
 
     if ([routePath isEqualToString:@"/uiHierarchy"]) {
         NSUInteger resolvedPort = 0;
-        NSString *proxyBody = [self proxyTouchResponseForPath:path timeout:1.2 resolvedPortOut:&resolvedPort];
+        NSString *proxyBody = [self proxyAppResponseForPath:path timeout:0.8 resolvedPortOut:&resolvedPort];
         if (proxyBody.length > 0) {
             return [self jsonResponse:200 body:proxyBody];
         }
@@ -2095,7 +2098,7 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
 
     if ([routePath isEqualToString:@"/a11y/interactive"]) {
         NSUInteger resolvedPort = 0;
-        NSString *proxyBody = [self proxyTouchResponseForPath:path timeout:1.2 resolvedPortOut:&resolvedPort];
+        NSString *proxyBody = [self proxyAppResponseForPath:path timeout:0.8 resolvedPortOut:&resolvedPort];
         if (proxyBody.length > 0) {
             return [self jsonResponse:200 body:proxyBody];
         }
@@ -2125,6 +2128,12 @@ static NSArray<NSString *> *TailFileLines(NSString *path, NSUInteger maxLines) {
     }
 
     if ([routePath isEqualToString:@"/a11y/activate"]) {
+        NSUInteger resolvedPort = 0;
+        NSString *proxyBody = [self proxyAppResponseForPath:path timeout:0.8 resolvedPortOut:&resolvedPort];
+        if (proxyBody.length > 0) {
+            return [self jsonResponse:200 body:proxyBody];
+        }
+
         NSInteger index = (NSInteger)[self floatValueFromQuery:path key:@"index"];
         if (index < 0) {
             NSString *json = @"{\"status\":\"error\",\"message\":\"Invalid index\"}";

@@ -322,6 +322,30 @@ static BOOL KimiRunZXTouchAvailable(void) {
     return YES;
 }
 
+static BOOL KimiRunRunOnMainQueueWithTimeout(NSTimeInterval timeout, BOOL (^block)(void)) {
+    if (!block) {
+        return NO;
+    }
+    if ([NSThread isMainThread]) {
+        return block();
+    }
+
+    NSTimeInterval safeTimeout = (timeout > 0.0) ? timeout : 1.0;
+    __block BOOL result = NO;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        result = block();
+        dispatch_semaphore_signal(sema);
+    });
+
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(safeTimeout * NSEC_PER_SEC));
+    if (dispatch_semaphore_wait(sema, deadline) != 0) {
+        NSLog(@"[KimiRunTouchInjection] Main-thread touch dispatch timed out after %.2fs", safeTimeout);
+        return NO;
+    }
+    return result;
+}
+
 @implementation KimiRunTouchInjection (GestureComposer)
 
 #pragma clang diagnostic push
@@ -360,11 +384,9 @@ static BOOL KimiRunZXTouchAvailable(void) {
     // Ensure touch injection runs on main thread
     if (![NSThread isMainThread]) {
         NSLog(@"[KimiRunTouchInjection] Dispatching to main thread...");
-        __block BOOL result = NO;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            result = [self tapAtX:x Y:y method:lower];
+        return KimiRunRunOnMainQueueWithTimeout(1.5, ^BOOL{
+            return [self tapAtX:x Y:y method:lower];
         });
-        return result;
     }
     
     if (!g_initialized) {
@@ -582,11 +604,9 @@ static BOOL KimiRunZXTouchAvailable(void) {
                           [lower isEqualToString:@"all"]);
 
     if (![NSThread isMainThread]) {
-        __block BOOL result = NO;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            result = [self swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:lower];
+        return KimiRunRunOnMainQueueWithTimeout(2.5, ^BOOL{
+            return [self swipeFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:lower];
         });
-        return result;
     }
 
     if (!g_initialized) {
@@ -764,11 +784,9 @@ static BOOL KimiRunZXTouchAvailable(void) {
                           [lower isEqualToString:@"all"]);
 
     if (![NSThread isMainThread]) {
-        __block BOOL result = NO;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            result = [self dragFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:lower];
+        return KimiRunRunOnMainQueueWithTimeout(3.0, ^BOOL{
+            return [self dragFromX:x1 Y:y1 toX:x2 Y:y2 duration:duration method:lower];
         });
-        return result;
     }
 
     if (!g_initialized) {
@@ -926,11 +944,9 @@ static BOOL KimiRunZXTouchAvailable(void) {
                           [lower isEqualToString:@"all"]);
 
     if (![NSThread isMainThread]) {
-        __block BOOL result = NO;
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            result = [self longPressAtX:x Y:y duration:duration method:lower];
+        return KimiRunRunOnMainQueueWithTimeout(3.0, ^BOOL{
+            return [self longPressAtX:x Y:y duration:duration method:lower];
         });
-        return result;
     }
 
     if (!g_initialized) {

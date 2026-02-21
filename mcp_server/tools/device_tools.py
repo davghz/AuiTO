@@ -242,7 +242,9 @@ class DeviceToolRegistry:
     
     def __init__(self, client: KimiRunDeviceClient = None):
         self.client = client or KimiRunDeviceClient()
-        self.daemon_port = int(os.environ.get("AUITO_DAEMON_PORT", str(self.client.port)))
+        self.daemon_port = int(
+            os.environ.get("AUITO_DAEMON_PORT", os.environ.get("KIMIRUN_DAEMON_PORT", "8876"))
+        )
         self._last_screenshot_hash: Optional[str] = None
         self._last_screenshot_bytes: int = 0
         self._stale_screenshot_count: int = 0
@@ -858,10 +860,14 @@ class DeviceToolRegistry:
     
     async def _handle_ui_hierarchy(self) -> List[TextContent]:
         """Handle device_get_ui_hierarchy tool"""
-        response = self.client.get("/uiHierarchy")
-        data = self._json_or_none(response)
-        if (response.status_code >= 400) or (not isinstance(data, dict)) or (not data.get("success")):
+        try:
             response = self._daemon_get("/uiHierarchy")
+            data = self._json_or_none(response)
+        except Exception:
+            response = self.client.get("/uiHierarchy")
+            data = self._json_or_none(response)
+        if (response.status_code >= 400) or (not isinstance(data, dict)) or (not data.get("success")):
+            response = self.client.get("/uiHierarchy")
             data = self._json_or_none(response)
         if not isinstance(data, dict):
             return [TextContent(type="text", text="UI hierarchy failed: Invalid JSON response")]
@@ -887,10 +893,22 @@ class DeviceToolRegistry:
     async def _handle_list_apps(self, arguments: dict) -> List[TextContent]:
         """Handle device_list_apps tool"""
         system_apps = arguments.get("system_apps", False)
-        response = self.client.get("/apps", params={"systemApps": "true" if system_apps else "false"})
-        data = self._json_or_none(response)
+        params = {"systemApps": "true" if system_apps else "false"}
+        try:
+            response = self._daemon_get("/apps", params=params)
+            data = self._json_or_none(response)
+        except Exception:
+            response = self.client.get("/apps", params=params)
+            data = self._json_or_none(response)
         if (response.status_code >= 400) or (not isinstance(data, dict)) or (not data.get("success")):
-            response = self._daemon_get("/apps", params={"systemApps": "true" if system_apps else "false"})
+            try:
+                response = self._daemon_get("/apps", params=params)
+                data = self._json_or_none(response)
+            except Exception:
+                response = self.client.get("/apps", params=params)
+                data = self._json_or_none(response)
+        if (response.status_code >= 400) or (not isinstance(data, dict)) or (not data.get("success")):
+            response = self.client.get("/apps", params=params)
             data = self._json_or_none(response)
         if not isinstance(data, dict):
             return [TextContent(type="text", text="List apps failed: Invalid JSON response")]
@@ -938,6 +956,13 @@ class DeviceToolRegistry:
             params["compact"] = "1"
         if limit and limit > 0:
             params["limit"] = str(limit)
+        try:
+            response = self._daemon_get("/a11y/interactive", params=params)
+            data = response.json()
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
         response = self.client.get("/a11y/interactive", params=params)
         return response.json()
 
@@ -1112,12 +1137,18 @@ class DeviceToolRegistry:
             params["compact"] = "1"
         if limit:
             params["limit"] = str(limit)
-        response = self.client.get("/a11y/interactive", params=params)
+        try:
+            response = self._daemon_get("/a11y/interactive", params=params)
+        except Exception:
+            response = self.client.get("/a11y/interactive", params=params)
         return [TextContent(type="text", text=response.text)]
 
     async def _handle_a11y_activate(self, arguments: dict) -> List[TextContent]:
         index = int(arguments.get("index"))
-        response = self.client.get("/a11y/activate", params={"index": index})
+        try:
+            response = self._daemon_get("/a11y/activate", params={"index": index})
+        except Exception:
+            response = self.client.get("/a11y/activate", params={"index": index})
         return [TextContent(type="text", text=f"Activated index {index}: {response.text}")]
 
     async def _handle_a11y_overlay(self, arguments: dict) -> List[TextContent]:
@@ -1127,7 +1158,10 @@ class DeviceToolRegistry:
             "enabled": "true" if enabled else "false",
             "interactiveOnly": "true" if interactive_only else "false",
         }
-        response = self.client.get("/a11y/overlay", params=params)
+        try:
+            response = self._daemon_get("/a11y/overlay", params=params)
+        except Exception:
+            response = self.client.get("/a11y/overlay", params=params)
         return [TextContent(type="text", text=response.text)]
 
     async def _handle_settings_safe_activate(self, arguments: dict) -> List[TextContent]:
@@ -1139,7 +1173,10 @@ class DeviceToolRegistry:
             self.client.get("/app/launch", params={"bundleID": "com.apple.Preferences"})
         time.sleep(0.2)
         ok = self._ensure_settings_root(max_steps=max_steps)
-        response = self.client.get("/a11y/activate", params={"index": index})
+        try:
+            response = self._daemon_get("/a11y/activate", params={"index": index})
+        except Exception:
+            response = self.client.get("/a11y/activate", params={"index": index})
         return [TextContent(type="text", text=f"Root OK={ok}. Activated index {index}: {response.text}")]
 
     async def _handle_touch_senderid(self) -> List[TextContent]:
